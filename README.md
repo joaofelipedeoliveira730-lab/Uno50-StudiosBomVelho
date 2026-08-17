@@ -1,25 +1,36 @@
-# Uno50 — reconstrução limpa
+# UNO DOS IDOSOS — edição ARENA 4.0
 
-Projeto reconstruído em Godot 4.6 .NET / C#. A interface é criada por código para manter o projeto pequeno e consistente.
+Projeto web multiplayer de UNO com personagens chibi 3D desenhados em SVG/CSS, personalização, passe de nível, loja, inventário, chat, salas online e painel CEO.
 
-## Escopo
-- Login/cadastro e recuperação indisponível
-- escolha de plataforma a cada entrada
-- perfil com 10 personagens/fotos locais
-- Solo, Duo e Trio locais
-- Online/salas: UI e camada ENet inicial (host/join)
-- cinco mapas históricos com identidade visual
-- configurações de desempenho
-- motor UNO server-authoritative preparado
-- proteção contra ações duplicadas, spam, timeout e abandono
+## Destaques desta edição
+- Personagens baixos, fofos e encorpados, com animação idle e reação ao toque.
+- Personalização preservada: cabelo, roupa, calça, tênis, acessórios, efeitos e personagem.
+- Carta descartada central maior para leitura rápida.
+- Baralho de compra separado ao lado da carta da mesa.
+- Mão do jogador otimizada para toque no celular.
+- Arena responsiva: celular em tela cheia e desktop em paisagem.
+- Pódio animado com 1º, 2º e 3º lugar.
+- UNO como modo principal da interface; outras rotinas antigas do servidor continuam isoladas para compatibilidade.
+- Sem desafio de matemática na experiência principal.
+- Áudio procedural leve, sem biblioteca pesada de efeitos.
 
-## Execução
-Instale o editor Godot .NET 4.6 e .NET 8.0. Abra `project.godot` e execute.
+## Deploy
+1. Suba os arquivos no GitHub.
+2. No Render, mantenha `npm install` e `npm start`.
+3. Configure `DATABASE_URL` e `JWT_SECRET`.
+4. Rode a migração SQL antes do primeiro uso.
 
-## Limitação importante
-O ambiente de construção usado para este pacote não possui Godot/.NET, então não foi possível executar o editor ou fazer build binário. Os testes automáticos do motor foram feitos fora do Godot em Python e a estrutura C# foi revisada estaticamente. Antes de produção, faça build no Godot .NET 4.6 e teste em Android e desktop.
+## Desempenho
+O pacote não foi inflado artificialmente para atingir 5 MB. O objetivo é entregar mais qualidade visual sem obrigar o celular a baixar arquivos inúteis. Os personagens são vetoriais e as animações usam CSS/SVG, mantendo o download pequeno e o jogo mais liso.
 
 
-## Servidor online
-`server.js` é o backend Node.js para o Render. O banco é PostgreSQL e a comunicação de partida usa WebSocket.
-O Godot não deve tentar rodar `server.js`; o cliente Godot se conecta ao endereço do Render.
+## Arena 4.0
+A partida foi redesenhada para seguir a composição da referência fornecida:
+- adversários em posições superior, esquerda e direita;
+- retratos quadrados dos personagens em vez de personagens de corpo inteiro na mesa;
+- mãos de cartas em leque na parte inferior;
+- baralho de compra e descarte grandes no centro;
+- HUD de partida, turno e estado AO VIVO;
+- visual quente de mesa/baralho, com alto contraste para celular;
+- partida solo não revela ao jogador se o oponente é participante;
+- o mesmo layout é usado para partidas online e solo.

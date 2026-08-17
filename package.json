@@ -1,13 +1,13 @@
 {
-  "name": "uno50-server",
-  "version": "1.2.0",
+  "name": "unovelho-matematixa-complete",
+  "version": "8.2.0",
   "private": true,
-  "description": "Servidor multiplayer do Uno50 para Render/PostgreSQL",
+  "description": "Uno Velho Matematixa — Mesa Viva, multiplayer UNO com PostgreSQL, Socket.IO, personagens, mapas e personalização.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js",
-    "bootstrap": "node bootstrap_ceo.js"
+    "dev": "node --watch server.js",
+    "migrate": "node migrate.js"
   },
   "engines": {
     "node": ">=20"
@@ -16,9 +16,9 @@
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "helmet": "^8.1.0",
+    "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3",
-    "ws": "^8.18.3"
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
   }
 }

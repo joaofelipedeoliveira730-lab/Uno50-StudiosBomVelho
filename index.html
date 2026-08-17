@@ -1,13 +1,303 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#090b11"><meta name="description" content="Uno50 — jogo de cartas multiplayer">
-<title>Uno50</title><link rel="stylesheet" href="/style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b66ff">
+<meta name="description" content="Uno dos Idosos — UNO, personagens e multiplayer.">
+<title>UNO Velho Matematixa — Mesa Viva</title>
+<link rel="stylesheet" href="style.css?v=20260816-8.2.0">
 </head>
 <body>
-<div id="cards" aria-hidden="true"></div>
-<main id="app"></main>
-<script src="/app.js" defer></script>
+
+<main id="platformScreen" class="screen platform-screen">
+  <section class="platform-card glass">
+    <div class="platform-logo"><span>U</span><div>UNO VELHO<small>MATEMATIXA</small></div></div>
+    <div class="platform-kicker">ANTES DE ENTRAR NA MESA</div>
+    <h1>Escolha sua plataforma</h1>
+    <p>O jogo se adapta ao modo escolhido. No celular, a interface se adapta ao retrato; no computador, ocupa a tela ampla.</p>
+    <div class="platform-options">
+      <button id="btnPlatformMobile" class="platform-option mobile" type="button"><b>Celular</b></button>
+      <button id="btnPlatformComputer" class="platform-option computer" type="button"><b>Computador</b></button>
+    </div>
+    <small class="platform-note">A escolha ajusta a interface para o seu jeito de jogar.</small>
+  </section>
+</main>
+
+<div id="gameStartOverlay" class="game-start-overlay hidden" aria-live="assertive" aria-label="Início da partida"></div>
+
+<div id="orientationGuard" class="orientation-guard hidden"><div class="rotate-phone">↻</div><h2>Virando a mesa...</h2><p>O jogo está ajustando a partida para a tela deitada.</p><button id="btnForceLandscape" class="btn btn-primary" type="button"> AJUSTAR TELA</button></div>
+
+<div id="bootScreen" class="boot-screen hidden">
+  <div class="universe-gallery" aria-hidden="true"><div class="universe-shot shot-a"></div><div class="universe-shot shot-b"></div><div class="universe-shot shot-c"></div><div class="universe-shot shot-d"></div></div>
+  <div class="boot-vignette"></div><div class="loader-logo">UNO<span>VELHO</span></div><div class="loader-ring"></div><div class="loader-status"><b>PREPARANDO A MESA MATEMATIXA</b><span>Preparando personagens • mesa • cartas • universo</span></div>
+</div>
+
+<main id="authScreen" class="screen auth-screen">
+  <div class="floating-cards" aria-hidden="true"><span class="float-card f1">7</span><span class="float-card f2">+2</span><span class="float-card f3"></span><span class="float-card f4">3</span><span class="float-card f5"></span><span class="float-card f6">9</span><span class="float-card f7">+4</span><span class="float-card f8">5</span></div>
+  <section class="auth-shell glass">
+    <div class="auth-brand"><div class="logo-mark" aria-label="Logo Uno Velho"><span>U</span><i>UNO</i></div><div><div class="brand-title">UNO VELHO</div><div class="brand-sub">MATEMATIXA</div></div></div>
+    <div class="auth-copy"><span class="pill"> UNO + PERSONAGENS</span><h1>Entre na mesa.</h1><p>Jogue sozinho, desafie jogadores e construa seu personagem.</p></div>
+    <div class="auth-tabs"><button class="auth-tab active" data-auth="login">ENTRAR</button><button class="auth-tab" data-auth="register">CRIAR CONTA</button></div>
+    <div class="auth-grid">
+      <form id="formLogin" class="auth-form glass-inner">
+        <div class="form-kicker"> ACESSO SEGURO</div><h2>Entrar no jogo</h2>
+        <label>Usuário<input name="username" autocomplete="username" maxlength="24" required placeholder="Seu usuário"></label>
+        <label>Senha<input name="password" type="password" autocomplete="current-password" required placeholder="Sua senha"></label>
+        <button class="btn btn-primary btn-wide" type="submit">ENTRAR NA CONTA</button><div id="loginMessage" class="form-message"></div>
+      </form>
+      <form id="formRegister" class="auth-form glass-inner hidden">
+        <div class="form-kicker"> NOVO JOGADOR</div><h2>Criar conta</h2>
+        <label>Usuário<input name="regUsername" maxlength="24" pattern="[A-Za-z0-9_]{3,24}" required placeholder="3 a 24 caracteres"></label>
+        <label>Senha<input name="regPassword" type="password" minlength="6" maxlength="100" required placeholder="Mínimo de 6 caracteres"></label>
+        <button class="btn btn-cyan btn-wide" type="submit">CRIAR CONTA E JOGAR</button><div id="registerMessage" class="form-message"></div>
+      </form>
+    </div>
+        <div class="auth-foot"> Login seguro • PostgreSQL • Socket.IO</div><div class="legal-row"><button id="btnTerms" class="text-btn" type="button"> Termos de Uso e Privacidade</button><span>Versão 8.2.1 • Mesa Viva • 2026</span></div>
+  </section>
+</main>
+
+<main id="appScreen" class="screen app-screen hidden">
+<header class="topbar glass">
+  <button id="brandHome" class="brand-button" type="button"><span class="mini-logo">U</span><span><b>UNO VELHO</b><small>MATEMATIXA</small></span></button>
+  <div class="top-actions"><button id="btnMail" class="mail-btn" type="button" title="Correio"><span id="mailBadge" class="mail-badge hidden">0</span></button><div class="currency"> <b id="coinValueTop">0</b></div><div class="level-chip"><span>NÍVEL</span><b id="levelValueTop">1</b></div><button id="btnOpenProfile" class="avatar-mini" type="button"></button><button id="btnOpenSettings" class="icon-btn" type="button"></button><button id="btnLogoutTop" class="session-btn" type="button">⏻ SAIR</button></div>
+</header>
+
+<section id="lobbyView" class="view lobby-v2">
+  <div class="menu-bg-scene" aria-hidden="true">
+    <div class="bg-glow glow-a"></div><div class="bg-glow glow-b"></div>
+    <div class="bg-card bg-card-a">7</div><div class="bg-card bg-card-b">+2</div><div class="bg-card bg-card-c">↻</div>
+    <div class="chase-track">
+      <div class="chase-dust dust-a"></div><div class="chase-dust dust-b"></div><div class="chase-dust dust-c"></div>
+      <div class="chase-old"><span class="old-cane">╱</span><span class="old-body"></span></div>
+      <div class="chase-mom"><span class="mom-body"></span><span class="slipper"></span></div>
+    </div>
+  </div>
+
+  <header class="menu-top-v2">
+    <div class="player-card-v2 glass">
+      <button id="btnOpenProfileMenu" class="menu-avatar-button" type="button"><span></span></button>
+      <div class="player-card-info"><b id="heroName">Jogador</b><span>NÍVEL <strong id="levelValue">1</strong></span><div class="xp-line"><span id="xpBar"></span></div><small><span id="xpValue">0</span> XP</small></div>
+    </div>
+    <div class="brand-3d-v2"><div class="uno-3d">UNO</div><div class="velho-3d">DO VELHO</div><span>MATEMATIXA</span></div>
+    <div class="economy-v2"><div class="coin-display"> <b id="coinValue">0</b></div></div>
+  </header>
+
+  <div class="menu-main-v2">
+    <section class="menu-character-column">
+      <div class="character-platform-v2">
+        <div id="heroCharacter" class="character-stage menu-character"></div>
+        <div class="platform-ring"></div>
+      </div>
+      <button id="btnCustomize" class="edit-skin-v2" type="button"><span></span><b>EDITAR SKIN</b></button>
+      <button id="btnInventory" class="character-small-action" type="button"> INVENTÁRIO</button><button id="btnCharacters" class="character-small-action character-book-btn" type="button"> PERSONAGENS</button>
+    </section>
+
+    <section class="main-buttons-v2">
+      <button id="btnPlay" class="big-menu-btn green" type="button"><span class="btn-icon"></span><span><b>JOGAR</b><small>ENTRAR EM UMA PARTIDA</small></span><i>›</i></button>
+      <button id="btnCreateRoomLobby" class="big-menu-btn blue" type="button"><span class="btn-icon"></span><span><b>CRIAR PARTIDA</b><small>CHAME SEUS AMIGOS</small></span><i>›</i></button>
+      <button id="btnMapsPreview" class="big-menu-btn gold" type="button"><span class="btn-icon"></span><span><b>ESCOLHER MAPA</b><small>BAR • NAVIO • CASA • TAVERNA</small></span><i>›</i></button>
+      <button id="btnShop" class="big-menu-btn purple" type="button"><span class="btn-icon"></span><span><b>LOJA</b><small>SKINS • ROUPAS • ACESSÓRIOS</small></span><i>›</i></button>
+      <button id="btnBattlePass" class="big-menu-btn pass-menu-btn" type="button"><span class="btn-icon"></span><span><b>PASSE DE NÍVEL</b><small>RECOMPENSAS • NÍVEL 1 → 100</small></span><i>›</i></button>
+      <button id="btnCEO" class="big-menu-btn ceo-menu-btn" type="button" hidden><span class="btn-icon"></span><span><b>PAINEL CEO</b><small>CONTROLE EXCLUSIVO • CEOVELHO</small></span><i>›</i></button>
+    </section>
+
+    <aside class="right-rail-v2">
+      <button id="btnOpenSettingsRail" class="rail-btn" type="button"><span></span><b>CONFIGURAÇÕES</b></button>
+      <button id="btnRankSmall" class="rail-btn" type="button"><span></span><b>RANK MUNDIAL</b><small>Indisponível no momento!</small></button>
+      <button id="btnGlobalChat" class="rail-btn chat-rail" type="button"><span></span><b>CHAT GLOBAL</b></button>
+    </aside>
+  </div>
+
+  <button id="btnGlobalChatOpen" class="global-chat-v2 glass global-chat-button" type="button"><span class="global-dot"></span><span><b>CHAT GLOBAL</b><small id="globalChatPreview">Sem novas mensagens</small></span><i></i></button>
+  <div class="menu-status-v2"><span> SERVIDORES ONLINE</span><span>•</span><span> JOGADORES CONECTADOS</span></div><button id="btnCEOFloat" class="ceo-floating glass" type="button" hidden> PAINEL CEO</button>
+</section>
+
+<section id="playView" class="view hidden modes-view">
+  <div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><div><h2>JOGAR UNO</h2><small class="subnav-subtitle">Escolha um modo de jogo.</small></div></div>
+  <div class="mode-hub-actions uno-only-play">
+    <button id="btnClassic" class="mode-hub-btn classic" type="button"><span></span><b>MODO CLÁSSICO</b><small>Solo • Duo • Trio</small></button><button id="btnTraining" class="mode-hub-btn training" type="button"><span></span><b>TREINAMENTO</b><small>Escolha a dificuldade</small></button>
+    <button id="btnOnline" class="mode-hub-btn online" type="button"><span></span><b>ONLINE</b><small>Crie ou entre em uma sala</small></button>
+  </div>
+  <div class="mode-showcase compact uno-only-showcase">
+    <article class="game-mode-card mode-uno"><div class="mode-art"></div><div><span class="mode-pill live">CLÁSSICO</span><h3>UNO VELHO MATEMATIXA</h3><p>A mesma mesa para jogar sozinho ou com 2 e 3 jogadores.</p></div></article>
+  </div>
+</section>
+<section id="classicView" class="view hidden classic-modes-view">
+  <div class="subnav"><button class="back-btn" data-back="play" type="button">← Voltar</button><div><h2>MODO CLÁSSICO</h2><small class="subnav-subtitle">Escolha o tamanho da mesa.</small></div></div>
+  <div class="classic-format-grid">
+    <button class="classic-mode-card" data-classic-format="solo" type="button"><span></span><b>SOLO</b><small>1 jogador + oponente</small><em>1 JOGADOR</em></button>
+    <button class="classic-mode-card" data-classic-format="duo" type="button"><span></span><b>DUO</b><small>2 lugares na mesa</small><em>2 JOGADORES</em></button>
+    <button class="classic-mode-card" data-classic-format="trio" type="button"><span></span><b>TRIO</b><small>3 lugares na mesa</small><em>3 JOGADORES</em></button>
+  </div>
+</section>
+<section id="trainingView" class="view hidden training-view">
+  <div class="subnav"><button class="back-btn" data-back="play" type="button">← Voltar</button><div><h2>TREINAMENTO</h2><small class="subnav-subtitle">Escolha a dificuldade para treinar.</small></div></div>
+  <div class="training-grid">
+    <button class="difficulty training-card" data-difficulty="easy" type="button"><span></span><b>FÁCIL</b><small>Para aprender a mesa.</small></button>
+    <button class="difficulty training-card" data-difficulty="medium" type="button"><span></span><b>MÉDIO</b><small>Mais estratégico.</small></button>
+    <button class="difficulty training-card" data-difficulty="hard" type="button"><span></span><b>DIFÍCIL</b><small>Oponente mais esperto.</small></button>
+  </div>
+</section>
+<section id="onlineModeView" class="view hidden">
+  <div class="subnav"><button class="back-btn" data-back="play" type="button">← Voltar</button><div><h2>UNO ONLINE</h2><small class="subnav-subtitle">Salas exclusivas de UNO dos Idosos.</small></div></div>
+  <div class="online-mode-grid uno-online-formats">
+    <button class="online-mode-card mode-uno format-card" data-online-mode="uno" data-format="duo" type="button"><span></span><b>DUO</b><small>2 lugares • matchmaking rápido</small><em>2 JOGADORES</em></button>
+    <button class="online-mode-card mode-trio format-card" data-online-mode="uno" data-format="trio" type="button"><span></span><b>TRIO</b><small>3 lugares • mesa equilibrada</small><em>3 JOGADORES</em></button>
+    <button class="online-mode-card mode-uno format-card" data-online-mode="uno" data-format="quad" type="button"><span></span><b>QUARTETO</b><small>4 lugares • mesa completa</small><em>4 JOGADORES</em></button>
+  </div>
+</section>
+<section id="soloView" class="view hidden">
+  <div class="subnav"><button class="back-btn" data-back="play" type="button">← VOLTAR</button><div><h2>SOLO CLÁSSICO</h2><small class="subnav-subtitle">Treinamento com dificuldade escolhida.</small></div><span class="version-chip">1.3.0</span></div>
+  <div class="solo-page-grid">
+    <div class="solo-main-panel">
+      <div class="solo-match-card glass"><span class="pill"> MATCHMAKING</span><h3>Partida solo</h3><p>Um tempo aleatório de até <b>30s</b> encontra sua mesa. Ao encontrar, o celular vibra, uma voz anuncia <b>“Partida encontrada!”</b> e começa a contagem de 5 segundos.</p></div>
+      <div class="solo-mode-grid uno-only-grid"><button class="solo-mode-card mode-uno" data-solo-mode="uno" type="button"><span></span><b>UNO</b><small>Partida individual</small></button></div>
+      <div class="solo-difficulty-row"><b>Dificuldade:</b><button class="difficulty" data-difficulty="easy" type="button"> Fácil</button><button class="difficulty" data-difficulty="medium" type="button"> Médio</button><button class="difficulty" data-difficulty="hard" type="button"> Difícil</button></div>
+    </div>
+    <aside class="friends-panel glass"><div class="panel-title"><span> AMIGOS</span><button id="btnAddFriend" class="text-btn" type="button">＋ ADICIONAR</button></div><div id="friendsList" class="friends-list"><div class="empty-state"><span></span><b>Carregando amigos...</b></div></div><small class="friends-help"> online •  ausente •  offline<br>O oponenteão ＋ aparece para quem está online.</small></aside>
+  </div>
+</section>
+<section id="roomsView" class="view hidden"><div class="subnav"><button class="back-btn" data-back="onlineModeView" type="button">← Modos</button><div><h2 id="roomsHeading">SALAS DE UNO</h2><small id="roomsModeSubtitle" class="subnav-subtitle">Escolha uma sala para entrar.</small></div><div class="subnav-actions"><button id="btnRefreshRooms" class="btn btn-secondary" type="button">↻ Atualizar</button><button id="btnCreateRoom" class="btn btn-primary" type="button">＋ CRIAR SALA</button></div></div><div id="roomsList" class="rooms-list"></div></section>
+<section id="roomView" class="view hidden"><div class="subnav"><button id="btnLeaveRoom" class="back-btn" type="button">← Sair da sala</button><h2 id="roomTitle">SALA</h2><span id="roomCodeBadge" class="code-badge">MATX-0000</span></div><div class="room-layout"><div class="room-main glass"><div class="room-options-bar"><span id="roomOptionsText">Sala</span><button id="btnStartRoom" class="btn btn-primary" type="button">▶ COMEÇAR</button></div><div id="roomPlayers" class="room-players"></div><div id="roomMapBanner" class="room-map-banner"></div></div><aside class="chat-panel glass"><div class="chat-head"><b> CHAT</b><span>ONLINE</span></div><div id="roomChatMessages" class="chat-messages"></div><form id="roomChatForm" class="chat-form" novalidate><input id="roomChatInput" maxlength="500" autocomplete="off" placeholder="Digite uma mensagem..."><button type="submit"></button></form></aside></div></section>
+
+<section id="gameView" class="view hidden game-view">
+  <div id="globalPauseBanner" class="pause-banner hidden"></div><div id="maintenanceOverlay" class="maintenance-overlay hidden" aria-live="assertive" aria-modal="true"><div class="maintenance-card glass"><div class="maintenance-icon"></div><span class="pill">UNO VELHO MATEMATIXA</span><h2>JOGO EM MANUTENÇÃO</h2><p id="maintenanceMessage">Estamos fazendo melhorias na mesa.</p><small>Volte em alguns instantes.</small></div></div><div id="podiumOverlay" class="podium-overlay hidden" aria-modal="true"></div>
+  <div class="game-stage-3d first-person-stage">
+    <aside id="gameGlobalChat" class="game-chat-left chat-panel glass hidden">
+      <div class="chat-head"><b> CHAT GLOBAL</b><button id="btnCloseGlobalChat" type="button">×</button></div>
+      <div id="gameChatTyping" class="game-chat-typing hidden"></div>
+      <div id="gameChatMessages" class="chat-messages"></div>
+      <form id="gameChatForm" class="chat-form" novalidate><input id="gameChatInput" maxlength="500" autocomplete="off" enterkeyhint="send" placeholder="Mensagem global..."><button type="submit"></button></form>
+    </aside>
+    <button id="btnGameGlobalChat" class="game-global-chat-toggle" type="button" aria-label="Abrir chat global"></button>
+
+    <div id="arenaShell" class="arena-shell arena-3d first-person-arena" data-map-theme="velho-bar">
+      <header class="arena-top">
+        <div class="game-stat game-stat-match"><span>PARTIDA</span><b id="roundText">2 VS 2</b></div>
+        <div id="turnStatus" class="turn-badge">SUA VEZ!</div><div class="arena-live-badge"><i></i> AO VIVO</div>
+        <div class="arena-tools"><button id="btnBackGameAlt" class="back-game-btn" type="button">← VOLTAR</button><button id="btnLogoutGame" class="session-game-btn" type="button" title="Encerrar sessão">⏻ SAIR</button><button id="btnReportPlayer" class="report-game-btn" type="button" title="Denunciar jogador"> DENUNCIAR</button><button id="btnSound" class="icon-btn" type="button" aria-label="Som"></button></div>
+      </header>
+
+      <div id="mapScene" class="saloon-map map-saloon first-person-map">
+        <div class="map-ceiling-lights"><i></i><i></i><i></i></div>
+        <div id="mapDecor" class="map-decor" aria-hidden="true"></div>
+        <div class="far-wall"><span class="map-sign">UNO DOS IDOSOS</span></div>
+        <div class="table-shadow"></div>
+        <div class="wood-table first-person-table">
+          <div class="table-rim"></div>
+          <div class="table-felt"></div>
+          <div class="table-grain"></div>
+          <div class="table-cup cup-left"></div><div class="table-cup cup-right"></div>
+        </div>
+      </div>
+
+      <div id="opponents" class="opponents table-players first-person-opponents"></div>
+
+      <div class="table-center-3d first-person-center">
+        <div class="deck-area"><button id="drawStack" class="draw-stack" type="button" aria-label="Comprar carta"><span class="uno-card back-card">UNO</span><b id="deckCount">0</b></button><small>COMPRAR</small></div>
+        <div class="discard-area main-discard"><div id="discardPile" class="uno-card card-red big-card center-card">7</div><div id="colorIndicator" class="color-indicator">VERMELHO</div></div>
+        <div id="playedCards" class="played-cards"></div>
+      </div>
+
+      <div class="table-status"><span id="gameTableMessage">Clique em uma carta para jogar.</span></div>
+      <div id="gameActionLayer" class="game-action-layer"></div>
+
+      <div class="first-person-hands" aria-hidden="true">
+        <div class="fp-arm fp-arm-left"></div><div class="fp-arm fp-arm-right"></div>
+        <div class="fp-hand fp-hand-left"></div><div class="fp-hand fp-hand-right"></div>
+      </div>
+
+      <div class="player-zone first-person-player-zone">
+        <div class="player-self"><div class="self-emote player-emote" data-emote-for="self"></div><div class="self-profile"><div id="gameAvatar" class="avatar-game avatar-photo-frame-self"></div><div><b id="gamePlayerName">Jogador</b><small id="gamePlayerId">ID: 0</small></div></div><button id="btnUno" class="uno-call" type="button">UNO!</button></div>
+        <div id="playerHand" class="hand-cards hand-fan-3d"></div>
+        <div class="game-emotes" id="emoteTray"><button data-emote="" type="button"></button><button data-emote="" type="button"></button><button data-emote="" type="button"></button><button data-emote="" type="button"></button><button data-emote="" type="button"></button><button data-emote="" type="button"></button></div>
+        <div id="gameToast" class="game-toast"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+
+
+
+<section id="charactersView" class="view hidden characters-page">
+  <div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><div><h2>PERSONAGENS</h2><small class="subnav-subtitle">Personagens originais, 3D em código e totalmente customizáveis.</small></div></div>
+  <div class="characters-layout">
+    <aside class="character-hero-panel glass"><span class="pill"> SEU PERSONAGEM</span><div id="charactersPreview" class="character-stage character-preview-3d"></div><h3 id="charactersPreviewName">Jogador</h3><p id="charactersPreviewPower">Poder: Nenhum equipado</p><button id="btnEditCharacterFromCharacters" class="btn btn-primary btn-wide" type="button"> CUSTOMIZAR</button></aside>
+    <section class="characters-catalog glass"><div class="characters-catalog-head"><div><span class="pill"> COLEÇÃO</span><h3>Escolha seu personagem</h3></div><small>Desbloqueios por passe, loja, XP ou moedas.</small></div><div id="charactersCatalog" class="characters-grid"></div></section>
+  </div>
+</section>
+<section id="customizeView" class="view hidden customize-page">
+  <div class="subnav"><button class="back-btn" data-back="characters" type="button">← Voltar</button><div><h2>EDITAR PERSONAGEM</h2><small class="subnav-subtitle">Escolha roupas, cabelo e acessórios com prévias visuais.</small></div><button id="btnSaveCharacterTop" class="btn btn-primary" type="button"> SALVAR</button></div>
+  <div class="custom-page-layout">
+    <aside class="custom-showcase glass">
+      <div class="showcase-badge"> SEU PERSONAGEM</div>
+      <div id="customCharacterPage" class="character-stage custom-page-character"></div>
+      <b id="customNamePage">Jogador</b><span id="customTitlePage" class="title-badge">INICIANTE</span>
+      <div class="equipped-list" id="equippedList"></div>
+      <button id="btnSaveCharacter" class="btn btn-primary btn-wide" type="button">SALVAR PERSONAGEM</button>
+    </aside>
+    <section class="custom-picker glass">
+      <div class="custom-picker-head"><div><span class="pill"> GUARDA-ROUPA</span><h3>Escolha seu estilo</h3></div><span id="customOwnedCount" class="owned-counter">0 itens</span></div>
+      <div class="custom-category-tabs" id="customCategoryTabs">
+        <button class="custom-cat active" data-custom-cat="top" type="button"> Roupas</button><button class="custom-cat" data-custom-cat="hair" type="button"> Cabelo</button><button class="custom-cat" data-custom-cat="oponentetom" type="button"> Calças</button><button class="custom-cat" data-custom-cat="shoes" type="button"> Tênis</button><button class="custom-cat" data-custom-cat="accessory" type="button"> Acessórios</button><button class="custom-cat" data-custom-cat="effect" type="button"> Efeitos</button>
+      </div>
+      <div id="customSkinStrip" class="skin-strip"><b> Pele</b><button class="swatch" data-skin="#f1c7a7" style="background:#f1c7a7" type="button" aria-label="Pele clara"></button><button class="swatch" data-skin="#d59b76" style="background:#d59b76" type="button" aria-label="Pele média"></button><button class="swatch" data-skin="#9b684a" style="background:#9b684a" type="button" aria-label="Pele morena"></button><button class="swatch" data-skin="#6b422e" style="background:#6b422e" type="button" aria-label="Pele escura"></button></div>
+      <div id="customCatalog" class="custom-catalog"></div>
+      <div class="custom-note"> Itens bloqueados podem ser comprados na loja. Itens já adquiridos podem ser equipados com um toque.</div>
+    </section>
+  </div>
+</section>
+<section id="battlePassView" class="view hidden">
+  <div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><div><h2> PASSE DE NÍVEL</h2><small class="subnav-subtitle">Chegue ao nível 100. Quanto mais alto, mais difícil.</small></div><button id="btnClaimAllPass" class="btn btn-primary" type="button"> COLETAR TUDO</button></div>
+  <div class="pass-hero glass"><div><span class="pill">UNO VELHO MATEMATIXA</span><h3>O caminho até o 100</h3><p>Começa fácil. Depois o XP sobe de verdade. Só os teimosos chegam ao 100.</p></div><div class="pass-level-big"><small>NÍVEL</small><b id="passCurrentLevel">1</b><span>/100</span></div></div>
+  <div class="pass-progress glass"><div class="pass-progress-head"><b id="passXpText">0 XP</b><span id="passNextText">Próximo nível</span></div><div class="pass-progress-track"><i id="passXpBar"></i></div></div>
+  <div id="passGrid" class="pass-grid"></div>
+</section>
+<section id="shopView" class="view hidden"><div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><h2>LOJA</h2><div class="shop-tabs"><button class="shop-tab active" data-shop="official" type="button"> CATÁLOGO</button></div></div><div id="shopGrid" class="item-grid"></div></section>
+<section id="inventoryView" class="view hidden"><div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><h2>INVENTÁRIO</h2></div><div class="profile-layout"><div class="profile-card glass"><div id="profileCharacterLarge" class="character-stage large"></div><h3 id="profileName">Jogador</h3><span id="profileTitle" class="title-badge">INICIANTE</span><div class="profile-stats"><div><b id="profileLevel">1</b><small>Nível</small></div><div><b id="profileWins">0</b><small>Vitórias</small></div><div><b id="profileGames">0</b><small>Partidas</small></div></div></div><div class="inventory-panel glass"><div class="inventory-tabs"><button class="inventory-tab active" data-inv="items" type="button"> Itens</button><button class="inventory-tab" data-inv="achievements" type="button"> Conquistas</button></div><div id="inventoryContent"></div></div></div></section>
+<section id="rankView" class="view hidden"><div class="subnav"><button class="back-btn" data-back="play" type="button">← Voltar</button><h2>RANK MUNDIAL</h2></div><div class="rank-table glass"><div class="rank-head"><span>#</span><span>Jogador</span><span>Nível</span><span>XP</span><span>Vitórias</span></div><div id="rankRows"></div></div></section>
+<section id="settingsView" class="view hidden"><div class="subnav"><button class="back-btn" data-back="lobby" type="button">← Voltar</button><h2>CONFIGURAÇÕES</h2></div><div class="settings-grid"><div class="panel glass"><h3> Áudio</h3><label class="toggle-row"><span>Música</span><input id="setMusic" type="checkbox"></label><label>Volume da música<input id="setMusicVol" type="range" min="0" max="1" step="0.05"></label><label class="toggle-row"><span>Efeitos</span><input id="setSfx" type="checkbox"></label><label>Volume dos efeitos<input id="setSfxVol" type="range" min="0" max="1" step="0.05"></label></div><div class="panel glass"><h3> Interface</h3><label class="toggle-row"><span>Animações</span><input id="setAnimations" type="checkbox"></label><label class="toggle-row"><span>Movimento reduzido</span><input id="setReducedMotion" type="checkbox"></label><h3> Chat</h3><label class="toggle-row"><span>Chat mundial</span><input id="setWorldChat" type="checkbox"></label><label class="toggle-row"><span>Chat da sala</span><input id="setRoomChat" type="checkbox"></label><label class="toggle-row"><span>Chat privado</span><input id="setPrivateChat" type="checkbox"></label><label class="toggle-row"><span>Não perturbe</span><input id="setDnd" type="checkbox"></label></div><div class="panel glass"><h3> Conta</h3><p id="accountInfo"></p><button id="btnLogout" class="btn btn-danger btn-wide" type="button">SAIR DA CONTA</button></div></div></section>
+</main>
+
+<div id="customizeModal" class="modal-overlay hidden"><div class="modal custom-modal"><div class="modal-head"><div><span class="pill"> CRIADOR</span><h2>Personalizar personagem</h2></div><button class="close-modal" data-close="customizeModal" type="button">×</button></div><div class="custom-layout"><div class="custom-preview"><div id="customCharacter" class="character-stage huge"></div><b id="customNamePreview">Jogador</b><span id="customTitlePreview" class="title-badge">INICIANTE</span></div><div class="custom-controls"><div class="control-section"><b> Aparência</b><div class="option-row"><button class="swatch" data-skin="#f1c7a7" style="background:#f1c7a7" type="button"></button><button class="swatch" data-skin="#d59b76" style="background:#d59b76" type="button"></button><button class="swatch" data-skin="#9b684a" style="background:#9b684a" type="button"></button><button class="swatch" data-skin="#6b422e" style="background:#6b422e" type="button"></button></div><label>Olhos<select id="customEyes"><option value="#1d2433">Azul escuro</option><option value="#2d6b3f">Verde</option><option value="#4d2b1d">Castanho</option><option value="#6e4bbd">Roxo</option></select></label><label>Cabelo<select id="customHair"></select></label><label>Cor do cabelo<select id="customHairColor"><option value="#171717">Preto</option><option value="#5a301c">Castanho</option><option value="#e2c044">Dourado</option><option value="#23d9ff">Neon</option><option value="#eaf7ff">Gelo</option></select></label></div><div class="control-section"><b> Roupas</b><label>Parte de cima<select id="customTop"></select></label><label>Parte de baixo<select id="customOponentetom"></select></label><label>Calçado<select id="customShoes"></select></label></div><div class="control-section"><b> Extras</b><label>Acessório<select id="customAccessory"></select></label><label>Aura<select id="customEffect"></select></label><label>Emote<select id="customEmote"></select></label><label>Título<select id="customTitle"></select></label></div><button id="btnSaveCharacterModal" class="btn btn-primary btn-wide" type="button">SALVAR PERSONAGEM</button></div></div></div></div>
+
+<div id="createRoomModal" class="modal-overlay hidden"><div class="modal modal-wide"><div class="modal-head"><div><span class="pill"> MULTIPLAYER</span><h2>Criar sala</h2></div><button class="close-modal" data-close="createRoomModal" type="button">×</button></div><div class="form-grid"><input type="hidden" id="roomGameMode" value="uno"><div class="full uno-room-mode"><span class="pill"> MODO FIXO</span><b>UNO VELHO MATEMATIXA</b><small>Esta versão é exclusiva para UNO.</small></div><label>Nome<input id="roomName" maxlength="40" placeholder="Mesa da galera"></label><label>Senha opcional<input id="roomPassword" maxlength="40" type="password"></label><label>Formato<select id="roomMax"><option value="2">DUO • 2</option><option value="3">TRIO • 3</option><option value="4" selected>QUARTETO • 4</option><option value="5">5 JOGADORES</option><option value="6">6 JOGADORES</option><option value="7">7 JOGADORES</option><option value="8">8 JOGADORES</option></select></label><label>Tempo<select id="roomTime"><option value="20">20s</option><option value="30">30s</option><option selected value="45">45s</option><option value="60">60s</option><option value="90">90s</option></select></label><label>Dificuldade<select id="roomDifficulty"><option value="easy">Fácil</option><option value="medium" selected>Médio</option><option value="hard">Difícil</option></select></label><label class="full">Mapa<select id="roomMap"></select></label><label>Cartas iniciais<select id="roomCards"><option>5</option><option>6</option><option selected>7</option><option>8</option><option>10</option></select></label><label class="toggle-row"><span>Cartas especiais</span><input id="roomSpecials" type="checkbox" checked></label><label class="toggle-row"><span>Empilhar +2/+4</span><input id="roomStack" type="checkbox"></label><label class="toggle-row"><span>Chat</span><input id="roomChat" type="checkbox" checked></label></div><div class="modal-actions"><button class="btn btn-secondary close-modal" data-close="createRoomModal" type="button">CANCELAR</button><button id="btnConfirmCreateRoom" class="btn btn-primary" type="button">CRIAR SALA</button></div></div></div>
+<div id="joinRoomModal" class="modal-overlay hidden"><div class="modal modal-narrow"><div class="modal-head"><h2>Entrar na sala</h2><button class="close-modal" data-close="joinRoomModal" type="button">×</button></div><p id="joinRoomInfo"></p><label>Senha<input id="joinRoomPassword" type="password"></label><button id="btnConfirmJoinRoom" class="btn btn-primary btn-wide" type="button">ENTRAR</button></div></div>
+<div id="colorModal" class="modal-overlay hidden"><div class="modal modal-narrow"><div class="math-icon"></div><h2>Escolha a cor</h2><div class="color-picker"><button data-color="red" type="button">VERMELHO</button><button data-color="yellow" type="button">AMARELO</button><button data-color="green" type="button">VERDE</button><button data-color="blue" type="button">AZUL</button></div></div></div>
+
+<div id="globalChatPanel" class="global-chat-panel glass hidden">
+  <div class="chat-head"><b> CHAT GLOBAL</b><button id="btnCloseGlobalChatLobby" type="button">×</button></div>
+  <div id="globalChatMessagesLobby" class="chat-messages"></div>
+  <form id="globalChatFormLobby" class="chat-form"><input id="globalChatInputLobby" maxlength="500" placeholder="Mensagem global..."><button type="submit"></button></form>
+</div>
+<div id="ceoPanel" class="modal-overlay hidden"><div class="modal modal-wide ceo-modal"><div class="modal-head"><div><span class="pill"> CEO</span><h2>Painel de Controle</h2><small>Conta autorizada: <b>CeoVelho</b></small></div><button class="close-modal" id="btnCloseCEO" type="button">×</button></div><div class="ceo-grid"><div class="panel"><h3> Ferramentas do CEO</h3><p class="ceo-help">Escolha um jogador e aplique somente a ação necessária. A conta <b>CeoVelho</b> nunca pode ser alterada por estas ferramentas.</p><div class="ceo-actions"><span class="ceo-action-note"> XP, moedas e inventário são alterados diretamente no banco.</span><button id="btnMaintenance" class="btn btn-danger btn-wide" type="button"> ATIVAR MODO MANUTENÇÃO</button><small id="maintenanceStatus" class="ceo-action-note">Jogo normal</small></div></div><div class="panel"><h3> Jogadores</h3><div id="ceoUsers" class="ceo-users"></div></div></div></div></div><div id="toastContainer" class="toast-container" aria-live="polite"></div>
+<script>
+(function(){
+  // Segurança contra versões antigas do PWA: nunca bloqueia o carregamento.
+  try {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(rs){
+        rs.forEach(function(r){ r.unregister().catch(function(){}); });
+      }).catch(function(){});
+    }
+    if ('caches' in window) {
+      caches.keys().then(function(keys){
+        keys.forEach(function(k){
+          if (/unovelho|uno/i.test(k)) caches.delete(k).catch(function(){});
+        });
+      }).catch(function(){});
+    }
+  } catch(e) {}
+})();
+</script>
+<script src="app.js?v=20260816-8.2.0" defer></script>
+
+
+<div id="mailModal" class="modal-overlay hidden"><div class="modal modal-wide"><div class="modal-head"><div><span class="pill"> CORREIO</span><h2>Convites</h2></div><button class="close-modal" data-close="mailModal" type="button">×</button></div><div id="mailContent" class="mail-content"></div></div></div>
+<div id="addFriendModal" class="modal-overlay hidden"><div class="modal"><div class="modal-head"><div><span class="pill"> AMIGOS</span><h2>Adicionar amigo</h2></div><button class="close-modal" data-close="addFriendModal" type="button">×</button></div><label>Usuário<input id="friendUsername" maxlength="24" placeholder="Nome do jogador"></label><div id="friendMessage" class="form-message"></div><div class="modal-actions"><button class="btn btn-secondary close-modal" data-close="addFriendModal" type="button">CANCELAR</button><button id="btnConfirmAddFriend" class="btn btn-primary" type="button">ADICIONAR</button></div></div></div>
+<div id="termsModal" class="modal-overlay hidden"><div class="modal modal-wide terms-modal"><div class="modal-head"><div><span class="pill"> LEGAL</span><h2>Termos de Uso e Privacidade</h2></div><button class="close-modal" data-close="termsModal" type="button">×</button></div><div class="terms-body"><p><b>1. Uso do jogo.</b> O UNO Velho Matematixa é um jogo online. Não tente explorar falhas, burlar sistemas ou prejudicar outros jogadores.</p><p><b>2. Conta.</b> Você é responsável por sua conta e senha. A equipe pode moderar ou suspender contas que violem as regras.</p><p><b>3. Chat.</b> Mensagens podem passar por moderação. Ameaças, assédio grave, conteúdo sexual, discurso de ódio, spam malicioso e incentivo a crimes não são permitidos.</p><p><b>4. Dados.</b> O jogo utiliza dados necessários para login, progresso, inventário, amigos, salas e recursos multiplayer.</p><p><b>5. Multiplayer.</b> Partidas e salas dependem de conexão e do servidor. Recursos podem entrar em manutenção e receber atualizações.</p><p><b>6. Atualização.</b> Esta interface pertence à <b>versão 1.3.0</b>, atualizada em <b>16/08/2026</b>.</p></div><div class="modal-actions"><button class="btn btn-primary close-modal" data-close="termsModal" type="button">ENTENDI</button></div></div></div>
 </body>
 </html>

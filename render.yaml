@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: unovelho
+    runtime: node
+    buildCommand: npm install && npm run migrate
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CEO_INITIAL_PASSWORD
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_ORIGIN
+        sync: false
