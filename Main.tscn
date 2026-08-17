@@ -1,6 +1,6 @@
 [gd_scene load_steps=2 format=3]
 
-[ext_resource path="res://Scripts/Uno50App.cs" type="Script" id="1"]
+[ext_resource path="res://Uno50App.cs" type="Script" id="1"]
 
 [node name="Uno50" type="Node2D"]
 script = ExtResource("1")

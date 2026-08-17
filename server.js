@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const http = require('http');
+const path = require('path');
 const express = require('express');
 const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
@@ -33,22 +34,20 @@ app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '32kb' }));
 
-// Endpoint inicial do Render. O servidor é o backend do jogo; o cliente Godot
-// se conecta por HTTP/WebSocket. Mantemos / útil para diagnóstico em vez de
-// deixar o Render responder "Cannot GET /".
-app.get('/', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: 'Uno50',
-    status: 'online',
-    version: '1.2.0 V2026',
-    endpoints: {
-      health: '/health',
-      auth: '/api/auth',
-      rooms: '/api/rooms',
-      websocket: 'ws(s)://<host>/?token=<JWT>'
-    }
-  });
+// Frontend web leve, mantido na raiz do projeto. Apenas arquivos explicitamente
+// permitidos são servidos; arquivos de servidor, SQL e segredos nunca ficam públicos.
+app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/app.js', (_req, res) => res.sendFile(path.join(__dirname, 'app.js')));
+app.get('/style.css', (_req, res) => res.sendFile(path.join(__dirname, 'style.css')));
+app.get('/characters/:id.svg', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1 || id > 10) return res.sendStatus(404);
+  res.sendFile(path.join(__dirname, `character_${id}.svg`));
+});
+app.get('/maps/:id.svg', (req, res) => {
+  const allowed = new Set(['pirate','egypt','rome','edo','silk']);
+  if (!allowed.has(req.params.id)) return res.sendStatus(404);
+  res.sendFile(path.join(__dirname, `${req.params.id}.svg`));
 });
 
 const httpRate = new Map();
@@ -141,6 +140,7 @@ function publicRoom(row) {
 /* --------------------------- UNO SERVER ENGINE --------------------------- */
 
 const COLORS = ['red', 'yellow', 'green', 'blue'];
+const TYPES = ['number', 'skip', 'reverse', 'draw2', 'wild', 'wild4'];
 
 function makeDeck() {
   const d = [];
@@ -527,7 +527,6 @@ app.post('/api/rooms', auth, async (req, res) => {
 });
 
 app.post('/api/rooms/:code/join', auth, async (req, res) => {
-  if (await banned(req.user.sub)) return res.status(403).json({ error: 'ACCOUNT_BLOCKED' });
   const c = String(req.params.code).toUpperCase();
   const { password } = req.body || {};
   const r = await pool.query('SELECT * FROM rooms WHERE code=$1 AND status=$2',[c,'waiting']);
