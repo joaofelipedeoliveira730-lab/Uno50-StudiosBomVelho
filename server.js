@@ -1,6566 +1,733 @@
 require('dotenv').config();
 
-const express = require('express');
 const http = require('http');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
+const express = require('express');
+const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const helmet = require('helmet');
 const { Pool } = require('pg');
-const { Server } = require('socket.io');
-
-const app = express();
-const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: {
-    origin: true,
-    credentials: true
-  }
-});
+const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 10000);
-
 const JWT_SECRET = process.env.JWT_SECRET;
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '';
-const isProduction = process.env.NODE_ENV === 'production';
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-
-if (!JWT_SECRET) {
-  console.warn(
-    '⚠️ JWT_SECRET não definido. Defina-o no Render antes de usar em produção.'
-  );
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  throw new Error('JWT_SECRET must be set and contain at least 32 characters.');
+}
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL must be set.');
 }
 
-const jwtSecret =
-  JWT_SECRET ||
-  (
-    process.env.DATABASE_URL
-      ? crypto
-          .createHash('sha256')
-          .update(process.env.DATABASE_URL)
-          .digest('hex')
-      : crypto
-          .createHash('sha256')
-          .update('unovelho-local-development-secret')
-          .digest('hex')
-  );
-
-/* =========================================================
-   EXPRESS
-========================================================= */
-
-app.disable('x-powered-by');
-
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false
-  })
-);
-
-app.use(express.json({ limit: '300kb' }));
-
-app.use(
-  express.urlencoded({
-    extended: false,
-    limit: '50kb'
-  })
-);
-
-/*
- * IMPORTANTE:
- * Esta linha faz o Render entregar:
- *
- * /
- * /index.html
- * /style.css
- * /app.js
- * /assets/*
- *
- * diretamente da raiz do projeto.
- */
-app.use(express.static(path.join(__dirname)));
-
-/*
- * Fallback explícito para a página inicial.
- * Se existir index.html, / abre o jogo.
- */
-app.get('/', (req, res) => {
-  const indexPath = path.join(__dirname, 'index.html');
-
-  if (!fs.existsSync(indexPath)) {
-    return res.status(500).send(
-      'ERRO: index.html não foi encontrado na raiz do projeto.'
-    );
-  }
-
-  res.sendFile(indexPath);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL.includes('localhost')
+    ? false
+    : { rejectUnauthorized: false },
+  max: Number(process.env.DB_POOL_MAX || 10),
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
 });
 
-/* =========================================================
-   BANCO
-========================================================= */
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(express.json({ limit: '32kb' }));
 
-let pool = null;
-let usePostgres = false;
-let databaseReady = false;
-let databaseReadyError = null;
-let databaseReadyPromise = null;
+// Endpoint inicial do Render. O servidor é o backend do jogo; o cliente Godot
+// se conecta por HTTP/WebSocket. Mantemos / útil para diagnóstico em vez de
+// deixar o Render responder "Cannot GET /".
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: 'Uno50',
+    status: 'online',
+    version: '1.2.0 V2026',
+    endpoints: {
+      health: '/health',
+      auth: '/api/auth',
+      rooms: '/api/rooms',
+      websocket: 'ws(s)://<host>/?token=<JWT>'
+    }
+  });
+});
 
+const httpRate = new Map();
 const rooms = new Map();
-const socketUsers = new Map();
+const sockets = new Set();
 
-const loginAttempts = new Map();
-const chatRate = new Map();
+const LIMITS = {
+  actionPerSecond: 8,
+  chatPer10Seconds: 10,
+  turnSeconds: 30,
+  reconnectSeconds: 60,
+  roomIdleSeconds: 900,
+  maxMatchSeconds: 3600,
+  maxMessageLength: 300
+};
 
-const localDbPath = path.join(__dirname, 'database.json');
+function now() { return Date.now(); }
+function uuid() { return crypto.randomUUID(); }
+function code() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
 
-function localDb() {
-  if (!fs.existsSync(localDbPath)) {
-    const db = {
-      users: [],
-      profiles: {},
-      inventory: {},
-      market: [],
-      actions: [],
-      messages: []
-    };
+function sign(user) {
+  return jwt.sign({ sub: String(user.id), username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+}
 
-    fs.writeFileSync(
-      localDbPath,
-      JSON.stringify(db, null, 2)
-    );
-
-    return db;
-  }
-
+function auth(req, res, next) {
   try {
-    return JSON.parse(
-      fs.readFileSync(localDbPath, 'utf8')
-    );
+    const h = req.headers.authorization || '';
+    if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'AUTH_REQUIRED' });
+    req.user = jwt.verify(h.slice(7), JWT_SECRET);
+    next();
   } catch {
-    return {
-      users: [],
-      profiles: {},
-      inventory: {},
-      market: [],
-      actions: [],
-      messages: []
-    };
+    return res.status(401).json({ error: 'INVALID_TOKEN' });
   }
 }
 
-function saveLocalDb(db) {
-  fs.writeFileSync(
-    localDbPath,
-    JSON.stringify(db, null, 2)
-  );
-}
-
-/* =========================================================
-   INICIALIZAÇÃO DO POSTGRESQL
-========================================================= */
-
-async function initDatabase() {
-  if (!process.env.DATABASE_URL) {
-    console.warn(
-      '⚠️ DATABASE_URL ausente. O servidor usará armazenamento local apenas para desenvolvimento.'
-    );
-
-    usePostgres = false;
-
-    localDb();
-
-    return;
-  }
-
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-
-    ssl: {
-      rejectUnauthorized: false
-    },
-
-    max: 8,
-
-    idleTimeoutMillis: 30000,
-
-    connectionTimeoutMillis: 10000,
-
-    keepAlive: true,
-
-    keepAliveInitialDelayMillis: 10000,
-
-    statement_timeout: 15000,
-
-    query_timeout: 20000
-  });
-
-  pool.on('error', err => {
-    console.error(
-      '❌ PostgreSQL pool:',
-      err.message
-    );
-  });
-
-  try {
-    await pool.query('SELECT 1');
-
-    const schemaPath = path.join(
-      __dirname,
-      'schema.sql'
-    );
-
-    if (!fs.existsSync(schemaPath)) {
-      throw new Error(
-        'schema.sql não encontrado na raiz do projeto.'
-      );
-    }
-
-    const schema = fs.readFileSync(
-      schemaPath,
-      'utf8'
-    );
-
-    await pool.query(schema);
-
-    const seedPath = path.join(
-      __dirname,
-      'seed.sql'
-    );
-
-    if (fs.existsSync(seedPath)) {
-      const seed = fs.readFileSync(
-        seedPath,
-        'utf8'
-      );
-
-      await pool.query(seed);
-    }
-
-    usePostgres = true;
-
-    await ensureCeo();
-
-    console.log(
-      '✅ PostgreSQL conectado e schema aplicado.'
-    );
-  } catch (err) {
-    console.error(
-      '❌ PostgreSQL/schema indisponível:',
-      err.message
-    );
-
-    try {
-      await pool.end();
-    } catch {}
-
-    pool = null;
-
-    usePostgres = false;
-
-    /*
-     * Em produção, NÃO esconder erro do banco.
-     */
-    if (
-      isProduction ||
-      process.env.DATABASE_URL
-    ) {
-      throw err;
-    }
-
-    localDb();
-  }
-}
-
-/* =========================================================
-   CEO
-========================================================= */
-
-async function ensureCeo() {
-  if (!pool) return;
-
-  const password = String(
-    process.env.CEO_INITIAL_PASSWORD || ''
-  ).trim();
-
-  const resetMarker =
-    'ceo_account_reset_v1';
-
-  const marker = await pool.query(
-    `
-      SELECT key
-      FROM app_bootstrap
-      WHERE key=$1
-      LIMIT 1
-    `,
-    [resetMarker]
-  );
-
-  /*
-   * Primeiro bootstrap.
-   */
-  if (!marker.rows.length) {
-    if (!password) {
-      throw new Error(
-        'CEO_INITIAL_PASSWORD não definido. Configure no Render para concluir o bootstrap do CeoVelho.'
-      );
-    }
-
-    const client = await pool.connect();
-
-    try {
-      await client.query('BEGIN');
-
-      /*
-       * Mantém somente o CEO solicitado
-       * no primeiro bootstrap.
-       */
-      await client.query(
-        `
-          DELETE FROM users
-          WHERE LOWER(username) <> LOWER($1)
-        `,
-        ['CeoVelho']
-      );
-
-      const hash = await bcrypt.hash(
-        password,
-        12
-      );
-
-      const existing = await client.query(
-        `
-          SELECT id
-          FROM users
-          WHERE LOWER(username)=LOWER('CeoVelho')
-          LIMIT 1
-        `
-      );
-
-      if (existing.rows.length) {
-        await client.query(
-          `
-            UPDATE users
-            SET
-              username='CeoVelho',
-              password_hash=$1,
-              role='CEO',
-              coins=999999999,
-              xp=9999999,
-              level=100
-            WHERE id=$2
-          `,
-          [
-            hash,
-            existing.rows[0].id
-          ]
-        );
-      } else {
-        await client.query(
-          `
-            INSERT INTO users(
-              username,
-              password_hash,
-              role,
-              coins,
-              xp,
-              level
-            )
-            VALUES(
-              'CeoVelho',
-              $1,
-              'CEO',
-              999999999,
-              9999999,
-              100
-            )
-          `,
-          [hash]
-        );
-      }
-
-      await client.query(
-        `
-          INSERT INTO app_bootstrap(key)
-          VALUES($1)
-        `,
-        [resetMarker]
-      );
-
-      await client.query('COMMIT');
-
-      console.log(
-        '👑 Bootstrap concluído: somente CeoVelho foi mantido/criado.'
-      );
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-
-    return;
-  }
-
-  /*
-   * Deploys seguintes:
-   * não apaga contas.
-   */
-  const found = await pool.query(
-    `
-      SELECT id, username, role
-      FROM users
-      WHERE LOWER(username)='ceovelho'
-      LIMIT 1
-    `
-  );
-
-  if (!found.rows.length) {
-    if (!password) {
-      throw new Error(
-        'CeoVelho não existe e CEO_INITIAL_PASSWORD não está definido.'
-      );
-    }
-
-    const hash = await bcrypt.hash(
-      password,
-      12
-    );
-
-    await pool.query(
-      `
-        INSERT INTO users(
-          username,
-          password_hash,
-          role,
-          coins,
-          xp,
-          level
-        )
-        VALUES(
-          'CeoVelho',
-          $1,
-          'CEO',
-          999999999,
-          9999999,
-          100
-        )
-      `,
-      [hash]
-    );
-
-    console.log(
-      '👑 Conta CeoVelho recriada.'
-    );
-  } else if (
-    found.rows[0].role !== 'CEO'
-  ) {
-    await pool.query(
-      `
-        UPDATE users
-        SET role='CEO'
-        WHERE id=$1
-      `,
-      [found.rows[0].id]
-    );
-  }
-}
-
-/* =========================================================
-   UTILITÁRIOS
-========================================================= */
-
-function parseCookies(req) {
-  const raw = req.headers.cookie || '';
-
-  const out = {};
-
-  raw.split(';').forEach(part => {
-    const i = part.indexOf('=');
-
-    if (i > -1) {
-      out[
-        part.slice(0, i).trim()
-      ] = decodeURIComponent(
-        part.slice(i + 1).trim()
-      );
-    }
-  });
-
-  return out;
-}
-
-function signToken(user) {
-  return jwt.sign(
-    {
-      id: user.id,
-      username: user.username,
-      role: user.role
-    },
-    jwtSecret,
-    {
-      expiresIn: '7d'
-    }
-  );
-}
-
-function setAuthCookie(res, token) {
-  res.setHeader(
-    'Set-Cookie',
-    `uv_session=${encodeURIComponent(
-      token
-    )}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${
-      isProduction ? '; Secure' : ''
-    }`
-  );
-}
-
-function clearAuthCookie(res) {
-  res.setHeader(
-    'Set-Cookie',
-    `uv_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${
-      isProduction ? '; Secure' : ''
-    }`
-  );
-}
-
-function verifyToken(token) {
-  try {
-    return jwt.verify(
-      token,
-      jwtSecret
-    );
-  } catch {
-    return null;
-  }
-}
-
-function tokenFromRequest(req) {
-  const cookies = parseCookies(req);
-
-  const bearer = (
-    req.headers.authorization || ''
-  )
-    .replace(/^Bearer\s+/i, '')
-    .trim();
-
-  return (
-    cookies.uv_session ||
-    bearer ||
-    null
-  );
-}
-
-function cleanText(
-  value,
-  max = 500
-) {
-  return String(value ?? '')
-    .replace(
-      /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
-      ''
-    )
-    .trim()
-    .slice(0, max);
-}
-
-function validUsername(v) {
-  return /^[A-Za-z0-9_]{3,24}$/.test(
-    v
-  );
-}
-
-function xpForLevel(level) {
-  return Math.floor(
-    100 * Math.pow(level - 1, 1.45)
-  );
-}
-
-function levelForXp(xp) {
-  let level = 1;
-
-  while (
-    level < 100 &&
-    xp >= xpForLevel(level + 1)
-  ) {
-    level++;
-  }
-
-  return level;
-}
-
-function publicUser(u) {
-  return {
-    id: u.id,
-    username: u.username,
-    role: u.role,
-    coins: Number(u.coins || 0),
-    xp: Number(u.xp || 0),
-    level: Number(u.level || 1),
-    wins: Number(u.wins || 0),
-    losses: Number(u.losses || 0),
-    gamesPlayed: Number(
-      u.games_played || 0
-    )
-  };
-}
-
-function defaultAvatar() {
-  return {
-    skinColor: '#d59b76',
-    eyes: '#1d2433',
-    hair: 'hair_basic',
-    hairColor: '#171717',
-    top: 'shirt_basic',
-    bottom: 'pants_basic',
-    shoes: 'shoes_basic',
-    accessory: null,
-    effect: null,
-    emote: 'emote_wave',
-    title: 'title_beginner'
-  };
-}
-
-function defaultSettings() {
-  return {
-    music: true,
-    musicVolume: 0.45,
-    sfx: true,
-    sfxVolume: 0.75,
-    animations: true,
-    chatWorld: true,
-    chatRoom: true,
-    chatPrivate: true,
-    reducedMotion: false
-  };
-}
-
-/* =========================================================
-   AUTENTICAÇÃO
-========================================================= */
-
-async function getUserById(id) {
-  if (usePostgres) {
-    const r = await pool.query(
-      `
-        SELECT
-          id,
-          username,
-          role,
-          coins,
-          xp,
-          level,
-          wins,
-          losses,
-          games_played,
-          created_at,
-          last_login_at
-        FROM users
-        WHERE id=$1
-      `,
-      [id]
-    );
-
-    return r.rows[0] || null;
-  }
-
-  const db = localDb();
-
-  const u = db.users.find(
-    x => x.id === Number(id)
-  );
-
-  return u ? { ...u } : null;
-}
-
-async function auth(
-  req,
-  res,
-  next
-) {
-  const token =
-    tokenFromRequest(req);
-
-  const payload =
-    token &&
-    verifyToken(token);
-
-  if (!payload) {
-    return res.status(401).json({
-      success: false,
-      message:
-        'Sessão expirada. Faça login novamente.'
-    });
-  }
-
-  const user =
-    await getUserById(payload.id);
-
-  if (!user) {
-    return res.status(401).json({
-      success: false,
-      message:
-        'Conta não encontrada.'
-    });
-  }
-
-  const moderation =
-    await activeModeration(
-      user.id
-    );
-
-  if (
-    moderation?.action === 'ban'
-  ) {
-    return res.status(403).json({
-      success: false,
-      message:
-        'Sua conta está suspensa.',
-      ban: moderation
-    });
-  }
-
-  req.user = user;
-
-  next();
-}
-
-function requireRole(...roles) {
-  return (
-    req,
-    res,
-    next
-  ) => {
-    if (
-      roles.includes(
-        req.user?.role
-      )
-    ) {
-      return next();
-    }
-
-    return res.status(403).json({
-      success: false,
-      message:
-        'Permissão insuficiente.'
-    });
-  };
-}
-
-/* =========================================================
-   PERFIL
-========================================================= */
-
-async function getProfile(
-  userId
-) {
-  if (usePostgres) {
-    const r = await pool.query(
-      `
-        SELECT
-          avatar,
-          settings,
-          bio,
-          updated_at
-        FROM profiles
-        WHERE user_id=$1
-      `,
-      [userId]
-    );
-
-    if (!r.rows[0]) {
-      return {
-        avatar: defaultAvatar(),
-        settings: defaultSettings(),
-        bio: ''
-      };
-    }
-
-    return {
-      avatar: {
-        ...defaultAvatar(),
-        ...(r.rows[0].avatar || {})
-      },
-
-      settings: {
-        ...defaultSettings(),
-        ...(r.rows[0].settings || {})
-      },
-
-      bio: r.rows[0].bio || '',
-
-      updatedAt:
-        r.rows[0].updated_at
-    };
-  }
-
-  const db = localDb();
-
-  const p =
-    db.profiles[userId];
-
-  if (!p) {
-    return {
-      avatar: defaultAvatar(),
-      settings: defaultSettings(),
-      bio: ''
-    };
-  }
-
-  return {
-    avatar: {
-      ...defaultAvatar(),
-      ...(p.avatar || {})
-    },
-
-    settings: {
-      ...defaultSettings(),
-      ...(p.settings || {})
-    },
-
-    bio: p.bio || ''
-  };
-}
-
-async function saveProfile(
-  userId,
-  profile
-) {
-  const avatar = {
-    ...defaultAvatar(),
-    ...(profile.avatar || {})
-  };
-
-  const settings = {
-    ...defaultSettings(),
-    ...(profile.settings || {})
-  };
-
-  const bio = cleanText(
-    profile.bio,
-    180
-  );
-
-  if (usePostgres) {
-    await pool.query(
-      `
-        INSERT INTO profiles(
-          user_id,
-          avatar,
-          settings,
-          bio
-        )
-        VALUES($1,$2,$3,$4)
-
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-          avatar=EXCLUDED.avatar,
-          settings=EXCLUDED.settings,
-          bio=EXCLUDED.bio,
-          updated_at=CURRENT_TIMESTAMP
-      `,
-      [
-        userId,
-        JSON.stringify(avatar),
-        JSON.stringify(settings),
-        bio
-      ]
-    );
-  } else {
-    const db = localDb();
-
-    db.profiles[userId] = {
-      avatar,
-      settings,
-      bio,
-      updatedAt:
-        new Date().toISOString()
-    };
-
-    saveLocalDb(db);
-  }
-
-  return {
-    avatar,
-    settings,
-    bio
-  };
-}
-
-/* =========================================================
-   MODERAÇÃO
-========================================================= */
-
-async function activeModeration(
-  userId
-) {
-  if (!usePostgres) {
-    return null;
-  }
-
-  const r = await pool.query(
-    `
-      SELECT
-        action,
-        reason,
-        expires_at
-
-      FROM moderation_actions
-
-      WHERE target_id=$1
-
-      AND action IN ('ban','mute')
-
-      AND (
-        expires_at IS NULL
-        OR expires_at>CURRENT_TIMESTAMP
-      )
-
-      ORDER BY created_at DESC
-
-      LIMIT 1
-    `,
-    [userId]
-  );
-
+async function userById(id) {
+  const r = await pool.query(`
+    SELECT u.id, u.username, u.email, u.is_active, u.is_banned,
+           p.avatar_id, p.platform, p.brightness, p.sound_enabled,
+           p.reduced_animations, p.leader_badge
+    FROM users u
+    JOIN profiles p ON p.user_id = u.id
+    WHERE u.id = $1
+  `, [id]);
   return r.rows[0] || null;
 }
 
-async function logAdmin(
-  actorId,
-  command,
-  args,
-  result = 'ok'
-) {
-  if (!usePostgres) {
-    return;
-  }
-
-  await pool.query(
-    `
-      INSERT INTO admin_logs(
-        actor_id,
-        command,
-        arguments,
-        result
-      )
-      VALUES($1,$2,$3,$4)
-    `,
-    [
-      actorId,
-      command,
-      cleanText(args, 500),
-      result
-    ]
-  );
+async function banned(id) {
+  const r = await pool.query(`
+    SELECT 1 FROM users WHERE id=$1 AND (is_banned OR NOT is_active)
+  `, [id]);
+  return r.rowCount > 0;
 }
 
-/* =========================================================
-   ECONOMIA
-========================================================= */
-
-async function addEconomy(
-  userId,
-  coinsDelta,
-  xpDelta
-) {
-  if (usePostgres) {
-    const r = await pool.query(
-      `
-        UPDATE users
-
-        SET
-          coins=GREATEST(
-            0,
-            coins+$1
-          ),
-
-          xp=GREATEST(
-            0,
-            xp+$2
-          )
-
-        WHERE id=$3
-
-        RETURNING
-          id,
-          username,
-          role,
-          coins,
-          xp,
-          wins,
-          losses,
-          games_played
-      `,
-      [
-        coinsDelta,
-        xpDelta,
-        userId
-      ]
-    );
-
-    if (!r.rows[0]) {
-      return null;
-    }
-
-    const level =
-      levelForXp(
-        Number(
-          r.rows[0].xp || 0
-        )
-      );
-
-    const updated =
-      await pool.query(
-        `
-          UPDATE users
-
-          SET level=$1
-
-          WHERE id=$2
-
-          RETURNING
-            id,
-            username,
-            role,
-            coins,
-            xp,
-            level,
-            wins,
-            losses,
-            games_played
-        `,
-        [
-          level,
-          userId
-        ]
-      );
-
-    return (
-      updated.rows[0] ||
-      r.rows[0]
-    );
-  }
-
-  const db = localDb();
-
-  const u = db.users.find(
-    x =>
-      x.id === Number(userId)
-  );
-
-  if (!u) {
-    return null;
-  }
-
-  u.coins = Math.max(
-    0,
-    (u.coins || 0) +
-      coinsDelta
-  );
-
-  u.xp = Math.max(
-    0,
-    (u.xp || 0) +
-      xpDelta
-  );
-
-  u.level =
-    levelForXp(u.xp);
-
-  saveLocalDb(db);
-
-  return u;
+function validUsername(v) {
+  return typeof v === 'string' && /^[A-Za-z0-9_]{3,24}$/.test(v);
 }
+function validPassword(v) {
+  return typeof v === 'string' && v.length >= 8 && v.length <= 128;
+}
+function validPlatform(v) { return v === 'mobile' || v === 'desktop'; }
+function validMode(v) { return ['solo', 'duo', 'trio'].includes(v); }
+function maxPlayers(mode) { return mode === 'solo' ? 2 : mode === 'duo' ? 2 : 3; }
 
-async function grantItem(
-  userId,
-  itemId
-) {
-  if (usePostgres) {
-    await pool.query(
-      `
-        INSERT INTO user_inventory(
-          user_id,
-          item_id
-        )
-        VALUES($1,$2)
-
-        ON CONFLICT(
-          user_id,
-          item_id
-        )
-
-        DO UPDATE SET
-          quantity=
-            user_inventory.quantity+1
-      `,
-      [
-        userId,
-        itemId
-      ]
-    );
-
-    return true;
-  }
-
-  const db = localDb();
-
-  db.inventory[userId] =
-    db.inventory[userId] || {};
-
-  db.inventory[userId][itemId] =
-    (db.inventory[userId][itemId] || 0) +
-    1;
-
-  saveLocalDb(db);
-
+function rate(key, max, windowMs) {
+  const t = now();
+  const old = httpRate.get(key) || [];
+  const fresh = old.filter(x => t - x < windowMs);
+  if (fresh.length >= max) return false;
+  fresh.push(t);
+  httpRate.set(key, fresh);
   return true;
 }
 
-async function hasItem(
-  userId,
-  itemId
-) {
-  if (usePostgres) {
-    const r =
-      await pool.query(
-        `
-          SELECT 1
-          FROM user_inventory
-          WHERE user_id=$1
-          AND item_id=$2
-        `,
-        [
-          userId,
-          itemId
-        ]
-      );
-
-    return !!r.rows.length;
-  }
-
-  const db = localDb();
-
-  return !!(
-    db.inventory[userId]?.[itemId]
-  );
-}
-
-async function getItems() {
-  if (!usePostgres) {
-    return [];
-  }
-
-  try {
-    const r =
-      await pool.query(
-        `
-          SELECT *
-          FROM items
-          WHERE is_active=true
-          ORDER BY category,price,id
-        `
-      );
-
-    return r.rows;
-  } catch (e) {
-    console.error(
-      'items:',
-      e.message
-    );
-
-    return [];
-  }
-}
-
-async function getInventory(
-  userId
-) {
-  if (usePostgres) {
-    try {
-      const r =
-        await pool.query(
-          `
-            SELECT
-              i.*,
-              ui.quantity,
-              ui.acquired_at
-
-            FROM user_inventory ui
-
-            JOIN items i
-              ON i.id=ui.item_id
-
-            WHERE ui.user_id=$1
-
-            ORDER BY
-              i.category,
-              i.name
-          `,
-          [userId]
-        );
-
-      return r.rows;
-    } catch (e) {
-      console.error(
-        'inventory:',
-        e.message
-      );
-
-      return [];
-    }
-  }
-
-  const db = localDb();
-
-  return Object.entries(
-    db.inventory[userId] || {}
-  ).map(
-    ([item_id, quantity]) => ({
-      id: item_id,
-      quantity
-    })
-  );
-}
-
-/* =========================================================
-   GEMINI - MODERAÇÃO OPCIONAL
-========================================================= */
-
-async function geminiModerate(
-  text
-) {
-  if (!GEMINI_API_KEY) {
-    return {
-      allowed: true,
-      reason: 'disabled'
-    };
-  }
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () => controller.abort(),
-      2500
-    );
-
-  try {
-    const response =
-      await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-          GEMINI_MODEL
-        )}:generateContent`,
-        {
-          method: 'POST',
-
-          headers: {
-            'Content-Type':
-              'application/json',
-
-            'x-goog-api-key':
-              GEMINI_API_KEY,
-
-            'x-goog-api-client':
-              'unovelho-matematixa/3.0'
-          },
-
-          body: JSON.stringify({
-            systemInstruction: {
-              parts: [
-                {
-                  text:
-                    'Você é um moderador de chat de um jogo infantil/familiar. Classifique somente como ALLOW, BLOCK ou REVIEW. BLOCK apenas para ameaça, assédio grave, sexualização, discurso de ódio, incentivo a crime ou spam malicioso. REVIEW para conteúdo suspeito. Responda JSON simples: {"decision":"ALLOW|BLOCK|REVIEW","reason":"breve"}.'
-                }
-              ]
-            },
-
-            contents: [
-              {
-                parts: [
-                  {
-                    text:
-                      cleanText(
-                        text,
-                        500
-                      )
-                  }
-                ]
-              }
-            ],
-
-            generationConfig: {
-              temperature: 0,
-              maxOutputTokens: 80
-            }
-          }),
-
-          signal:
-            controller.signal
-        }
-      );
-
-    if (!response.ok) {
-      return {
-        allowed: true,
-        reason: 'api-error'
-      };
-    }
-
-    const data =
-      await response.json();
-
-    const raw =
-      data?.candidates?.[0]?.content?.parts
-        ?.map(
-          p => p.text || ''
-        )
-        .join('') || '';
-
-    const match =
-      raw.match(
-        /\{[\s\S]*\}/
-      );
-
-    if (!match) {
-      return {
-        allowed: true,
-        reason: 'parse'
-      };
-    }
-
-    const parsed =
-      JSON.parse(
-        match[0]
-      );
-
-    return {
-      allowed:
-        parsed.decision !==
-        'BLOCK',
-
-      review:
-        parsed.decision ===
-        'REVIEW',
-
-      reason:
-        parsed.reason || ''
-    };
-  } catch {
-    return {
-      allowed: true,
-      reason: 'timeout'
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/* =========================================================
-   LIMITADOR
-========================================================= */
-
-function rateLimit(
-  map,
-  key,
-  windowMs,
-  max
-) {
-  const now =
-    Date.now();
-
-  const arr =
-    (
-      map.get(key) || []
-    ).filter(
-      t =>
-        now - t <
-        windowMs
-    );
-
-  if (
-    arr.length >= max
-  ) {
-    map.set(
-      key,
-      arr
-    );
-
-    return false;
-  }
-
-  arr.push(now);
-
-  map.set(
-    key,
-    arr
-  );
-
-  return true;
-}
-
-/* =========================================================
-   DB QUERY
-========================================================= */
-
-async function dbQuery(
-  text,
-  params = []
-) {
-  if (!pool) {
-    throw new Error(
-      'PostgreSQL não está disponível.'
-    );
-  }
-
-  try {
-    return await pool.query(
-      text,
-      params
-    );
-  } catch (err) {
-    const reconnectCodes = [
-      'ECONNRESET',
-      'ECONNREFUSED',
-      'ETIMEDOUT',
-      '57P01',
-      '57P02',
-      '57P03',
-      '08000',
-      '08001',
-      '08003',
-      '08004',
-      '08006',
-      '08007',
-      '08009'
-    ];
-
-    if (
-      !reconnectCodes.includes(
-        String(
-          err?.code || ''
-        )
-      )
-    ) {
-      throw err;
-    }
-
-    await new Promise(
-      r =>
-        setTimeout(
-          r,
-          250
-        )
-    );
-
-    return pool.query(
-      text,
-      params
-    );
-  }
-}
-
-/* =========================================================
-   ESTADO GLOBAL
-========================================================= */
-
-let globalState = {
-  paused: false,
-  message: ''
-};
-
-async function getGlobalState() {
-  if (!usePostgres) {
-    return {
-      paused: false,
-      message: ''
-    };
-  }
-
-  const r =
-    await pool.query(
-      `
-        SELECT
-          paused,
-          message
-        FROM global_game_state
-        WHERE id=1
-      `
-    );
-
-  return (
-    r.rows[0] || {
-      paused: false,
-      message: ''
-    }
-  );
-}
-
-/* =========================================================
-   HEALTH
-========================================================= */
-
-app.get(
-  '/health',
-  async (req, res) => {
-    try {
-      if (usePostgres && pool) {
-        await pool.query(
-          'SELECT 1'
-        );
-      }
-
-      return res.json({
-        ok: true,
-        service:
-          'UnoVelho Matematixa',
-        database:
-          usePostgres
-            ? 'ok'
-            : 'local',
-        version:
-          '2026.08'
-      });
-    } catch (err) {
-      return res.status(503).json({
-        ok: false,
-        service:
-          'UnoVelho Matematixa',
-        database:
-          'error',
-        error:
-          err.message
-      });
-    }
-  }
-);
-
-app.get(
-  '/api/health',
-  async (
-    req,
-    res
-  ) => {
-    const ready =
-      databaseReady;
-
-    res.status(
-      ready ? 200 : 503
-    ).json({
-      ok: ready,
-      postgres:
-        usePostgres,
-      ready,
-      rooms:
-        rooms.size,
-      paused:
-        globalState.paused,
-      error: ready
-        ? undefined
-        : 'Banco de dados ainda inicializando.'
-    });
-  }
-);
-
-/* =========================================================
-   AGUARDAR BANCO
-========================================================= */
-
-async function requireDatabase(
-  req,
-  res,
-  next
-) {
-  try {
-    if (databaseReady) {
-      return next();
-    }
-
-    if (
-      databaseReadyPromise
-    ) {
-      await databaseReadyPromise;
-    }
-
-    if (databaseReady) {
-      return next();
-    }
-
-    return res.status(503).json({
-      success: false,
-      message:
-        'Servidor ainda está inicializando. Tente novamente em alguns segundos.'
-    });
-  } catch (err) {
-    console.error(
-      '❌ Banco não pronto:',
-      err.message
-    );
-
-    return res.status(503).json({
-      success: false,
-      message:
-        'Banco de dados temporariamente indisponível.'
-    });
-  }
-}
-
-/* =========================================================
-   API - USUÁRIO
-========================================================= */
-
-app.get(
-  '/api/me',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    const profile =
-      await getProfile(
-        req.user.id
-      );
-
-    res.json({
-      success: true,
-      user:
-        publicUser(
-          req.user
-        ),
-      profile
-    });
-  }
-);
-
-app.post(
-  '/api/logout',
-  (
-    req,
-    res
-  ) => {
-    clearAuthCookie(
-      res
-    );
-
-    res.json({
-      success: true
-    });
-  }
-);
-
-/* =========================================================
-   REGISTRO
-========================================================= */
-
-app.post(
-  '/api/register',
-  requireDatabase,
-  async (
-    req,
-    res
-  ) => {
-    /*
-     * Para o teste inicial:
-     * somente CeoVelho.
-     */
-    return res.status(403).json({
-      success: false,
-      message:
-        'Cadastro temporariamente desativado. Use a conta CeoVelho para o teste inicial.'
-    });
-  }
-);
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-app.post(
-  '/api/login',
-  requireDatabase,
-  async (
-    req,
-    res
-  ) => {
-    const username =
-      cleanText(
-        req.body.username,
-        24
-      );
-
-    const password =
-      String(
-        req.body.password || ''
-      );
-
-    if (
-      !username ||
-      !password
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Informe usuário e senha.'
-      });
-    }
-
-    if (
-      !rateLimit(
-        loginAttempts,
-        req.ip,
-        60000,
-        10
-      )
-    ) {
-      return res.status(429).json({
-        success: false,
-        message:
-          'Muitas tentativas de login. Aguarde um minuto.'
-      });
-    }
-
-    try {
-      let user = null;
-
-      if (usePostgres) {
-        const r =
-          await dbQuery(
-            `
-              SELECT *
-              FROM users
-              WHERE LOWER(username)=LOWER($1)
-              LIMIT 1
-            `,
-            [username]
-          );
-
-        user =
-          r.rows[0] ||
-          null;
-      } else {
-        const db =
-          localDb();
-
-        user =
-          db.users.find(
-            u =>
-              u.username.toLowerCase() ===
-              username.toLowerCase()
-          ) || null;
-      }
-
-      if (
-        !user ||
-        !(
-          await bcrypt.compare(
-            password,
-            user.password_hash
-          )
-        )
-      ) {
-        return res.status(401).json({
-          success: false,
-          message:
-            'Usuário ou senha incorretos.'
-        });
-      }
-
-      const mod =
-        await activeModeration(
-          user.id
-        );
-
-      if (
-        mod?.action ===
-        'ban'
-      ) {
-        return res.status(403).json({
-          success: false,
-          message:
-            'Conta suspensa.',
-          ban: mod
-        });
-      }
-
-      if (usePostgres) {
-        await dbQuery(
-          `
-            UPDATE users
-            SET last_login_at=CURRENT_TIMESTAMP
-            WHERE id=$1
-          `,
-          [user.id]
-        );
-      }
-
-      const token =
-        signToken(user);
-
-      setAuthCookie(
-        res,
-        token
-      );
-
-      /*
-       * Itens iniciais.
-       */
-      for (
-        const id of [
-          'hair_basic',
-          'shirt_basic',
-          'pants_basic',
-          'shoes_basic',
-          'emote_wave',
-          'title_beginner',
-          'deck_classic',
-          'map_classroom'
-        ]
-      ) {
-        if (usePostgres) {
-          try {
-            await grantItem(
-              user.id,
-              id
-            );
-          } catch (
-            itemErr
-          ) {
-            console.error(
-              'starter item login:',
-              itemErr.message
-            );
-          }
-        }
-      }
-
-      let profile;
-
-      try {
-        profile =
-          await getProfile(
-            user.id
-          );
-      } catch (
-        profileErr
-      ) {
-        console.error(
-          'profile login:',
-          profileErr.message
-        );
-
-        profile = {
-          avatar:
-            defaultAvatar(),
-          settings:
-            defaultSettings(),
-          bio: ''
-        };
-      }
-
-      res.json({
-        success: true,
-
-        message:
-          user.role ===
-          'CEO'
-            ? 'Bem-vindo de volta, CEO!'
-            : 'Login realizado com sucesso!',
-
-        token,
-
-        user:
-          publicUser(
-            user
-          ),
-
-        profile,
-
-        needsCustomization:
-          !profile.avatar ||
-          Object.keys(
-            profile.avatar
-          ).length === 0
-      });
-    } catch (e) {
-      console.error(e);
-
-      res.status(500).json({
-        success: false,
-        message:
-          'Erro no login.'
-      });
-    }
-  }
-);
-
-/* =========================================================
-   PERFIL
-========================================================= */
-
-app.put(
-  '/api/profile',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const avatar =
-        req.body.avatar ||
-        {};
-
-      const allowed = [
-        'skinColor',
-        'eyes',
-        'hair',
-        'hairColor',
-        'top',
-        'bottom',
-        'shoes',
-        'accessory',
-        'effect',
-        'emote',
-        'title'
-      ];
-
-      const cleanAvatar = {};
-
-      for (
-        const k of allowed
-      ) {
-        cleanAvatar[k] =
-          cleanText(
-            avatar[k],
-            80
-          );
-      }
-
-      const profile =
-        await saveProfile(
-          req.user.id,
-          {
-            avatar:
-              cleanAvatar,
-
-            settings:
-              req.body.settings ||
-              {},
-
-            bio:
-              req.body.bio ||
-              ''
-          }
-        );
-
-      res.json({
-        success: true,
-        profile
-      });
-    } catch (e) {
-      res.status(500).json({
-        success: false,
-        message:
-          'Não foi possível salvar o personagem.'
-      });
-    }
-  }
-);
-
-/* =========================================================
-   SOLO
-========================================================= */
-
-app.post(
-  '/api/game/solo-finish',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    const win =
-      Boolean(
-        req.body.win
-      );
-
-    const coins =
-      Math.min(
-        1000,
-        Math.max(
-          0,
-          Math.floor(
-            Number(
-              req.body.coins
-            ) || 0
-          )
-        )
-      );
-
-    const xp =
-      Math.min(
-        5000,
-        Math.max(
-          0,
-          Math.floor(
-            Number(
-              req.body.xp
-            ) || 0
-          )
-        )
-      );
-
-    try {
-      if (usePostgres) {
-        const r =
-          await pool.query(
-            `
-              UPDATE users
-
-              SET
-                coins=coins+$1,
-                xp=xp+$2,
-                wins=wins+$3,
-                losses=losses+$4,
-                games_played=
-                  games_played+1
-
-              WHERE id=$5
-
-              RETURNING *
-            `,
-            [
-              coins,
-              xp,
-              win ? 1 : 0,
-              win ? 0 : 1,
-              req.user.id
-            ]
-          );
-
-        const u =
-          r.rows[0];
-
-        const lvl =
-          levelForXp(
-            Number(
-              u.xp || 0
-            )
-          );
-
-        const rr =
-          await pool.query(
-            `
-              UPDATE users
-
-              SET level=$1
-
-              WHERE id=$2
-
-              RETURNING
-                id,
-                username,
-                role,
-                coins,
-                xp,
-                level,
-                wins,
-                losses,
-                games_played
-            `,
-            [
-              lvl,
-              req.user.id
-            ]
-          );
-
-        return res.json({
-          success: true,
-          user:
-            publicUser(
-              rr.rows[0] ||
-              u
-            )
-        });
-      }
-
-      const u =
-        await addEconomy(
-          req.user.id,
-          coins,
-          xp
-        );
-
-      if (u) {
-        u.wins =
-          (u.wins || 0) +
-          (win ? 1 : 0);
-
-        u.losses =
-          (u.losses || 0) +
-          (win ? 0 : 1);
-
-        u.games_played =
-          (u.games_played || 0) +
-          1;
-
-        const db =
-          localDb();
-
-        const lu =
-          db.users.find(
-            x =>
-              x.id ===
-              u.id
-          );
-
-        if (lu) {
-          Object.assign(
-            lu,
-            {
-              wins:
-                u.wins,
-              losses:
-                u.losses,
-              games_played:
-                u.games_played,
-              level:
-                levelForXp(
-                  lu.xp
-                )
-            }
-          );
-        }
-
-        saveLocalDb(
-          db
-        );
-      }
-
-      return res.json({
-        success: true,
-        user:
-          publicUser(u)
-      });
-    } catch (e) {
-      console.error(e);
-
-      res.status(500).json({
-        success: false,
-        message:
-          'Não foi possível salvar a recompensa.'
-      });
-    }
-  }
-);
-
-/* =========================================================
-   INVENTÁRIO / ITENS
-========================================================= */
-
-app.get(
-  '/api/inventory',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    res.json({
-      success: true,
-      items:
-        await getInventory(
-          req.user.id
-        )
-    });
-  }
-);
-
-app.get(
-  '/api/items',
-  async (
-    req,
-    res
-  ) => {
-    res.json({
-      success: true,
-      items:
-        await getItems()
-    });
-  }
-);
-
-/* =========================================================
-   LOJA
-========================================================= */
-
-app.get(
-  '/api/shop/market',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.json({
-        success: true,
-        listings: []
-      });
-    }
-
-    const r =
-      await pool.query(
-        `
-          SELECT
-            m.listing_id,
-            m.price,
-            m.created_at,
-            i.*,
-            u.username seller
-
-          FROM player_market m
-
-          JOIN items i
-            ON i.id=m.item_id
-
-          JOIN users u
-            ON u.id=m.seller_id
-
-          WHERE m.status='active'
-
-          ORDER BY
-            m.created_at DESC
-
-          LIMIT 100
-        `
-      );
-
-    res.json({
-      success: true,
-      listings:
-        r.rows
-    });
-  }
-);
-
-app.post(
-  '/api/shop/buy',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    const itemId =
-      cleanText(
-        req.body.itemId,
-        80
-      );
-
-    if (!usePostgres) {
-      return res.status(503).json({
-        success: false,
-        message:
-          'Loja online exige PostgreSQL.'
-      });
-    }
-
-    const client =
-      await pool.connect();
-
-    try {
-      await client.query(
-        'BEGIN'
-      );
-
-      const item =
-        (
-          await client.query(
-            `
-              SELECT *
-              FROM items
-              WHERE id=$1
-              AND is_active=true
-              FOR UPDATE
-            `,
-            [itemId]
-          )
-        ).rows[0];
-
-      if (!item) {
-        throw new Error(
-          'Item não encontrado.'
-        );
-      }
-
-      if (
-        item.asset?.ceoOnly &&
-        req.user.role !==
-          'CEO'
-      ) {
-        throw new Error(
-          'Item exclusivo do CEO.'
-        );
-      }
-
-      const own =
-        await client.query(
-          `
-            SELECT 1
-            FROM user_inventory
-            WHERE user_id=$1
-            AND item_id=$2
-          `,
-          [
-            req.user.id,
-            itemId
-          ]
-        );
-
-      if (own.rows.length) {
-        throw new Error(
-          'Você já possui este item.'
-        );
-      }
-
-      const buyer =
-        (
-          await client.query(
-            `
-              SELECT
-                coins,
-                xp
-              FROM users
-              WHERE id=$1
-              FOR UPDATE
-            `,
-            [req.user.id]
-          )
-        ).rows[0];
-
-      if (
-        Number(
-          buyer.xp
-        ) <
-        Number(
-          item.xp_required
-        )
-      ) {
-        throw new Error(
-          `Você precisa de ${item.xp_required} XP.`
-        );
-      }
-
-      if (
-        Number(
-          buyer.coins
-        ) <
-        Number(
-          item.price
-        )
-      ) {
-        throw new Error(
-          'Moedas insuficientes.'
-        );
-      }
-
-      await client.query(
-        `
-          UPDATE users
-          SET coins=coins-$1
-          WHERE id=$2
-        `,
-        [
-          item.price,
-          req.user.id
-        ]
-      );
-
-      await client.query(
-        `
-          INSERT INTO user_inventory(
-            user_id,
-            item_id
-          )
-          VALUES($1,$2)
-        `,
-        [
-          req.user.id,
-          itemId
-        ]
-      );
-
-      await client.query(
-        'COMMIT'
-      );
-
-      res.json({
-        success: true,
-        message:
-          'Item desbloqueado!',
-        item
-      });
-    } catch (e) {
-      await client.query(
-        'ROLLBACK'
-      );
-
-      res.status(400).json({
-        success: false,
-        message:
-          e.message
-      });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-/* =========================================================
-   MERCADO
-========================================================= */
-
-app.post(
-  '/api/shop/market/list',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.status(503).json({
-        success: false,
-        message:
-          'Loja de jogadores exige PostgreSQL.'
-      });
-    }
-
-    const itemId =
-      cleanText(
-        req.body.itemId,
-        80
-      );
-
-    const price =
-      Math.floor(
-        Number(
-          req.body.price
-        )
-      );
-
-    if (
-      !itemId ||
-      !Number.isFinite(
-        price
-      ) ||
-      price < 10 ||
-      price > 100000000
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Preço inválido.'
-      });
-    }
-
-    const client =
-      await pool.connect();
-
-    try {
-      await client.query(
-        'BEGIN'
-      );
-
-      const own =
-        (
-          await client.query(
-            `
-              SELECT quantity
-              FROM user_inventory
-              WHERE user_id=$1
-              AND item_id=$2
-              FOR UPDATE
-            `,
-            [
-              req.user.id,
-              itemId
-            ]
-          )
-        ).rows[0];
-
-      if (!own) {
-        throw new Error(
-          'Você não possui o item.'
-        );
-      }
-
-      const active =
-        await client.query(
-          `
-            SELECT 1
-            FROM player_market
-            WHERE seller_id=$1
-            AND item_id=$2
-            AND status='active'
-          `,
-          [
-            req.user.id,
-            itemId
-          ]
-        );
-
-      if (active.rows.length) {
-        throw new Error(
-          'Esse item já está anunciado.'
-        );
-      }
-
-      await client.query(
-        `
-          DELETE FROM user_inventory
-          WHERE user_id=$1
-          AND item_id=$2
-        `,
-        [
-          req.user.id,
-          itemId
-        ]
-      );
-
-      const r =
-        await client.query(
-          `
-            INSERT INTO player_market(
-              seller_id,
-              item_id,
-              price
-            )
-            VALUES($1,$2,$3)
-            RETURNING *
-          `,
-          [
-            req.user.id,
-            itemId,
-            price
-          ]
-        );
-
-      await client.query(
-        'COMMIT'
-      );
-
-      res.json({
-        success: true,
-        listing:
-          r.rows[0]
-      });
-    } catch (e) {
-      await client.query(
-        'ROLLBACK'
-      );
-
-      res.status(400).json({
-        success: false,
-        message:
-          e.message
-      });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-app.post(
-  '/api/shop/market/cancel',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.status(503).json({
-        success: false,
-        message:
-          'Loja de jogadores exige PostgreSQL.'
-      });
-    }
-
-    const listingId =
-      Number(
-        req.body.listingId
-      );
-
-    const client =
-      await pool.connect();
-
-    try {
-      await client.query(
-        'BEGIN'
-      );
-
-      const l =
-        (
-          await client.query(
-            `
-              SELECT *
-              FROM player_market
-              WHERE listing_id=$1
-              AND seller_id=$2
-              AND status='active'
-              FOR UPDATE
-            `,
-            [
-              listingId,
-              req.user.id
-            ]
-          )
-        ).rows[0];
-
-      if (!l) {
-        throw new Error(
-          'Anúncio não encontrado.'
-        );
-      }
-
-      await client.query(
-        `
-          UPDATE player_market
-          SET status='cancelled'
-          WHERE listing_id=$1
-        `,
-        [listingId]
-      );
-
-      await client.query(
-        `
-          INSERT INTO user_inventory(
-            user_id,
-            item_id
-          )
-          VALUES($1,$2)
-
-          ON CONFLICT(
-            user_id,
-            item_id
-          )
-
-          DO UPDATE SET
-            quantity=
-              user_inventory.quantity+1
-        `,
-        [
-          req.user.id,
-          l.item_id
-        ]
-      );
-
-      await client.query(
-        'COMMIT'
-      );
-
-      res.json({
-        success: true,
-        message:
-          'Anúncio cancelado e item devolvido.'
-      });
-    } catch (e) {
-      await client.query(
-        'ROLLBACK'
-      );
-
-      res.status(400).json({
-        success: false,
-        message:
-          e.message
-      });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-app.post(
-  '/api/shop/market/buy',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.status(503).json({
-        success: false,
-        message:
-          'Loja de jogadores exige PostgreSQL.'
-      });
-    }
-
-    const listingId =
-      Number(
-        req.body.listingId
-      );
-
-    const client =
-      await pool.connect();
-
-    try {
-      await client.query(
-        'BEGIN'
-      );
-
-      const l =
-        (
-          await client.query(
-            `
-              SELECT
-                m.*,
-                i.name,
-                i.asset
-
-              FROM player_market m
-
-              JOIN items i
-                ON i.id=m.item_id
-
-              WHERE m.listing_id=$1
-              AND m.status='active'
-
-              FOR UPDATE
-            `,
-            [listingId]
-          )
-        ).rows[0];
-
-      if (!l) {
-        throw new Error(
-          'Anúncio não encontrado.'
-        );
-      }
-
-      if (
-        l.seller_id ===
-        req.user.id
-      ) {
-        throw new Error(
-          'Você não pode comprar seu próprio anúncio.'
-        );
-      }
-
-      const buyer =
-        (
-          await client.query(
-            `
-              SELECT coins
-              FROM users
-              WHERE id=$1
-              FOR UPDATE
-            `,
-            [req.user.id]
-          )
-        ).rows[0];
-
-      if (
-        Number(
-          buyer.coins
-        ) <
-        Number(
-          l.price
-        )
-      ) {
-        throw new Error(
-          'Moedas insuficientes.'
-        );
-      }
-
-      const seller =
-        (
-          await client.query(
-            `
-              SELECT id
-              FROM users
-              WHERE id=$1
-              FOR UPDATE
-            `,
-            [l.seller_id]
-          )
-        ).rows[0];
-
-      if (!seller) {
-        throw new Error(
-          'Vendedor não encontrado.'
-        );
-      }
-
-      await client.query(
-        `
-          UPDATE users
-          SET coins=coins-$1
-          WHERE id=$2
-        `,
-        [
-          l.price,
-          req.user.id
-        ]
-      );
-
-      await client.query(
-        `
-          UPDATE users
-          SET coins=coins+$1
-          WHERE id=$2
-        `,
-        [
-          l.price,
-          l.seller_id
-        ]
-      );
-
-      await client.query(
-        `
-          DELETE FROM user_inventory
-          WHERE user_id=$1
-          AND item_id=$2
-        `,
-        [
-          l.seller_id,
-          l.item_id
-        ]
-      );
-
-      await client.query(
-        `
-          INSERT INTO user_inventory(
-            user_id,
-            item_id
-          )
-          VALUES($1,$2)
-
-          ON CONFLICT(
-            user_id,
-            item_id
-          )
-
-          DO UPDATE SET
-            quantity=
-              user_inventory.quantity+1
-        `,
-        [
-          req.user.id,
-          l.item_id
-        ]
-      );
-
-      await client.query(
-        `
-          UPDATE player_market
-
-          SET
-            status='sold',
-            sold_at=CURRENT_TIMESTAMP
-
-          WHERE listing_id=$1
-        `,
-        [listingId]
-      );
-
-      await client.query(
-        'COMMIT'
-      );
-
-      res.json({
-        success: true,
-        message:
-          'Compra concluída!'
-      });
-    } catch (e) {
-      await client.query(
-        'ROLLBACK'
-      );
-
-      res.status(400).json({
-        success: false,
-        message:
-          e.message
-      });
-    } finally {
-      client.release();
-    }
-  }
-);
-
-/* =========================================================
-   RANK
-========================================================= */
-
-app.get(
-  '/api/rank',
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.json({
-        success: true,
-        players: []
-      });
-    }
-
-    const r =
-      await pool.query(
-        `
-          SELECT
-            username,
-            level,
-            xp,
-            wins,
-            games_played
-
-          FROM users
-
-          WHERE role<>'banned'
-
-          ORDER BY
-            level DESC,
-            xp DESC,
-            wins DESC
-
-          LIMIT 100
-        `
-      );
-
-    res.json({
-      success: true,
-      players:
-        r.rows
-    });
-  }
-);
-
-/* =========================================================
-   DENÚNCIA
-========================================================= */
-
-app.post(
-  '/api/report',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (!usePostgres) {
-      return res.json({
-        success: true
-      });
-    }
-
-    const target =
-      Number(
-        req.body.targetId
-      );
-
-    const reason =
-      cleanText(
-        req.body.reason,
-        255
-      );
-
-    if (
-      !target ||
-      !reason
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Denúncia incompleta.'
-      });
-    }
-
-    await pool.query(
-      `
-        INSERT INTO reports(
-          reporter_id,
-          target_id,
-          reason
-        )
-        VALUES($1,$2,$3)
-      `,
-      [
-        req.user.id,
-        target,
-        reason
-      ]
-    );
-
-    res.json({
-      success: true,
-      message:
-        'Denúncia enviada.'
-    });
-  }
-);
-
-/* =========================================================
-   SALAS
-========================================================= */
-
-app.get(
-  '/api/rooms',
-  auth,
-  (
-    req,
-    res
-  ) => {
-    res.json({
-      success: true,
-
-      rooms:
-        [
-          ...rooms.values()
-        ]
-          .filter(
-            r =>
-              !r.started &&
-              !r.locked
-          )
-          .map(
-            roomSummary
-          )
-    });
-  }
-);
-
-app.post(
-  '/api/rooms',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    if (
-      globalState.paused
-    ) {
-      return res.status(423).json({
-        success: false,
-        message:
-          globalState.message ||
-          'O jogo está paralisado.'
-      });
-    }
-
-    const options =
-      normalizeRoomOptions(
-        req.body
-      );
-
-    const code =
-      makeRoomCode();
-
-    const room = {
-      code,
-
-      name:
-        cleanText(
-          req.body.name ||
-            `Sala de ${req.user.username}`,
-          40
-        ),
-
-      ownerId:
-        req.user.id,
-
-      ownerName:
-        req.user.username,
-
-      password:
-        cleanText(
-          req.body.password,
-          40
-        ),
-
-      options,
-
-      players: [],
-
-      started: false,
-
-      locked: false,
-
-      game: null,
-
-      createdAt:
-        Date.now()
-    };
-
-    room.players.push(
-      makeRoomPlayer(
-        req.user
-      )
-    );
-
-    rooms.set(
-      code,
-      room
-    );
-
-    res.json({
-      success: true,
-      room:
-        roomSummary(
-          room
-        ),
-      roomCode:
-        code
-    });
-  }
-);
-
-app.post(
-  '/api/rooms/:code/join',
-  auth,
-  async (
-    req,
-    res
-  ) => {
-    const room =
-      rooms.get(
-        String(
-          req.params.code
-        ).toUpperCase()
-      );
-
-    if (!room) {
-      return res.status(404).json({
-        success: false,
-        message:
-          'Sala não encontrada.'
-      });
-    }
-
-    if (room.started) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'A partida já começou.'
-      });
-    }
-
-    if (
-      room.password &&
-      room.password !==
-        String(
-          req.body.password ||
-            ''
-        )
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Senha incorreta.'
-      });
-    }
-
-    if (
-      room.players.length >=
-      room.options.maxPlayers
-    ) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'Sala cheia.'
-      });
-    }
-
-    if (
-      !room.players.some(
-        p =>
-          p.userId ===
-          req.user.id
-      )
-    ) {
-      room.players.push(
-        makeRoomPlayer(
-          req.user
-        )
-      );
-    }
-
-    emitRoom(
-      room
-    );
-
-    res.json({
-      success: true,
-      room:
-        roomSummary(
-          room
-        )
-    });
-  }
-);
-
-app.post(
-  '/api/rooms/:code/leave',
-  auth,
-  (
-    req,
-    res
-  ) => {
-    const room =
-      rooms.get(
-        String(
-          req.params.code
-        ).toUpperCase()
-      );
-
-    if (!room) {
-      return res.json({
-        success: true
-      });
-    }
-
-    removePlayer(
-      room,
-      req.user.id
-    );
-
-    res.json({
-      success: true
-    });
-  }
-);
-
-app.post(
-  '/api/rooms/:code/start',
-  auth,
-  (
-    req,
-    res
-  ) => {
-    const room =
-      rooms.get(
-        String(
-          req.params.code
-        ).toUpperCase()
-      );
-
-    if (!room) {
-      return res.status(404).json({
-        success: false,
-        message:
-          'Sala não encontrada.'
-      });
-    }
-
-    if (
-      room.ownerId !==
-      req.user.id
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Somente o criador inicia a sala.'
-      });
-    }
-
-    if (
-      room.players.length < 2 &&
-      !room.options.allowBots
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Adicione pelo menos 2 jogadores ou ative bots.'
-      });
-    }
-
-    if (
-      globalState.paused
-    ) {
-      return res.status(423).json({
-        success: false,
-        message:
-          globalState.message ||
-          'Jogo paralisado.'
-      });
-    }
-
-    while (
-      room.players.length <
-        room.options.maxPlayers &&
-      room.options.allowBots &&
-      room.players.length <
-        room.options.botFill
-    ) {
-      room.players.push(
-        makeBotPlayer(
-          room.players.length
-        )
-      );
-    }
-
-    startRoomGame(
-      room
-    );
-
-    res.json({
-      success: true,
-      room:
-        roomSummary(
-          room
-        )
-    });
-  }
-);
-
-/* =========================================================
-   SALAS - FUNÇÕES
-========================================================= */
-
-function normalizeRoomOptions(
-  body
-) {
+function publicRoom(row) {
   return {
-    maxPlayers:
-      Math.min(
-        8,
-        Math.max(
-          2,
-          Number(
-            body.maxPlayers
-          ) || 4
-        )
-      ),
-
-    turnSeconds:
-      Math.min(
-        120,
-        Math.max(
-          15,
-          Number(
-            body.turnSeconds
-          ) || 45
-        )
-      ),
-
-    allowBots:
-      body.allowBots !==
-      false,
-
-    botFill:
-      Math.min(
-        8,
-        Math.max(
-          2,
-          Number(
-            body.botFill
-          ) || 4
-        )
-      ),
-
-    difficulty:
-      [
-        'easy',
-        'medium',
-        'hard'
-      ].includes(
-        body.difficulty
-      )
-        ? body.difficulty
-        : 'medium',
-
-    mapId:
-      cleanText(
-        body.mapId ||
-          'map_saloon',
-        80
-      ),
-
-    deckId:
-      cleanText(
-        body.deckId ||
-          'deck_classic',
-        80
-      ),
-
-    specials:
-      body.specials !==
-      false,
-
-    math: true,
-
-    chat:
-      body.chat !==
-      false,
-
-    worldChat:
-      body.worldChat !==
-      false,
-
-    privateChat:
-      body.privateChat !==
-      false,
-
-    stackDraw:
-      body.stackDraw ===
-      true,
-
-    startingCards:
-      Math.min(
-        12,
-        Math.max(
-          5,
-          Number(
-            body.startingCards
-          ) || 7
-        )
-      )
+    code: row.code,
+    name: row.name,
+    visibility: row.visibility,
+    mode: row.mode,
+    bots: row.bots,
+    mapId: row.map_id,
+    description: row.description,
+    status: row.status,
+    players: Number(row.players || 0),
+    maxPlayers: Number(row.max_players)
   };
 }
 
-function makeRoomCode() {
-  let c;
+/* --------------------------- UNO SERVER ENGINE --------------------------- */
 
-  do {
-    c =
-      'MATX-' +
-      Math.random()
-        .toString(36)
-        .slice(2, 6)
-        .toUpperCase();
-  } while (
-    rooms.has(c)
-  );
+const COLORS = ['red', 'yellow', 'green', 'blue'];
 
-  return c;
-}
-
-function makeRoomPlayer(
-  user
-) {
-  return {
-    userId:
-      user.id,
-
-    username:
-      user.username,
-
-    role:
-      user.role,
-
-    avatar:
-      null,
-
-    connected:
-      true,
-
-    hand: [],
-
-    isBot:
-      false
-  };
-}
-
-function makeBotPlayer(
-  n
-) {
-  return {
-    userId:
-      `bot-${Date.now()}-${n}`,
-
-    username: [
-      'Calculinho',
-      'Fibonacci',
-      'Ada',
-      'Newton',
-      'Gauss',
-      'Euler',
-      'Turing',
-      'Hipátia'
-    ][n % 8],
-
-    role:
-      'bot',
-
-    avatar:
-      null,
-
-    connected:
-      true,
-
-    hand: [],
-
-    isBot:
-      true
-  };
-}
-
-function roomSummary(
-  room
-) {
-  return {
-    code:
-      room.code,
-
-    name:
-      room.name,
-
-    ownerId:
-      room.ownerId,
-
-    ownerName:
-      room.ownerName,
-
-    locked:
-      !!room.password,
-
-    started:
-      room.started,
-
-    players:
-      room.players.map(
-        p => ({
-          userId:
-            p.userId,
-
-          username:
-            p.username,
-
-          role:
-            p.role,
-
-          connected:
-            p.connected,
-
-          isBot:
-            p.isBot,
-
-          cardCount:
-            p.hand?.length ||
-            0
-        })
-      ),
-
-    options:
-      room.options,
-
-    createdAt:
-      room.createdAt
-  };
-}
-
-function emitRoom(
-  room
-) {
-  io
-    .to(
-      `room:${room.code}`
-    )
-    .emit(
-      'room:update',
-      roomSummary(
-        room
-      )
-    );
-
-  io.emit(
-    'rooms:update'
-  );
-}
-
-function removePlayer(
-  room,
-  userId
-) {
-  const i =
-    room.players.findIndex(
-      p =>
-        String(
-          p.userId
-        ) ===
-        String(
-          userId
-        )
-    );
-
-  if (i < 0) {
-    return;
+function makeDeck() {
+  const d = [];
+  for (const color of COLORS) {
+    d.push({ color, type: 'number', value: 0 });
+    for (let n = 1; n <= 9; n++) {
+      d.push({ color, type: 'number', value: n });
+      d.push({ color, type: 'number', value: n });
+    }
+    for (let i = 0; i < 2; i++) {
+      d.push({ color, type: 'skip' });
+      d.push({ color, type: 'reverse' });
+      d.push({ color, type: 'draw2' });
+    }
   }
+  for (let i = 0; i < 4; i++) {
+    d.push({ color: 'wild', type: 'wild' });
+    d.push({ color: 'wild', type: 'wild4' });
+  }
+  for (let i = d.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [d[i], d[j]] = [d[j], d[i]];
+  }
+  return d;
+}
 
-  if (room.started) {
-    room.players[i]
-      .connected = false;
+function playable(card, top, activeColor) {
+  return card.type === 'wild' || card.type === 'wild4' ||
+    card.color === activeColor ||
+    card.color === top.color ||
+    (card.type === 'number' && top.type === 'number' && card.value === top.value) ||
+    (card.type !== 'number' && card.type === top.type);
+}
 
-    room.players[i]
-      .hand = [];
+class UnoMatch {
+  constructor(matchId, room, playerRows) {
+    this.id = matchId;
+    this.roomId = room.id;
+    this.mode = room.mode;
+    this.mapId = room.map_id;
+    this.players = playerRows.map(x => ({
+      seat: Number(x.seat),
+      userId: x.user_id ? Number(x.user_id) : null,
+      isBot: Boolean(x.is_bot),
+      hand: [],
+      missedTurns: 0,
+      disconnectedAt: null
+    }));
+    this.draw = makeDeck();
+    this.discard = [];
+    this.activeColor = COLORS[0];
+    this.currentSeat = 1;
+    this.direction = 1;
+    this.startedAt = now();
+    this.turnDeadline = now() + LIMITS.turnSeconds * 1000;
+    this.finished = false;
+    this.winner = null;
+    this.sequence = 0;
+    this.lastActionAt = now();
 
-    io
-      .to(
-        `room:${room.code}`
-      )
-      .emit(
-        'room:system',
-        {
-          message:
-            `${room.players[i].username} saiu da partida.`
-        }
-      );
-  } else {
-    room.players.splice(
-      i,
-      1
-    );
-
-    if (
-      room.ownerId ===
-        userId &&
-      room.players.length
-    ) {
-      room.ownerId =
-        room.players[0]
-          .userId;
-
-      room.ownerName =
-        room.players[0]
-          .username;
+    for (const p of this.players) {
+      for (let i = 0; i < 7; i++) p.hand.push(this.drawCard());
     }
 
-    if (
-      !room.players.length
-    ) {
-      rooms.delete(
-        room.code
-      );
+    let first = this.drawCard();
+    while (first.type === 'wild4' || first.type === 'wild') {
+      this.draw.push(first);
+      first = this.drawCard();
+    }
+    this.discard.push(first);
+    this.activeColor = first.color;
+  }
+
+  drawCard() {
+    if (this.draw.length === 0) {
+      if (this.discard.length <= 1) throw new Error('DRAW_EMPTY');
+      const top = this.discard.pop();
+      this.draw = this.discard.splice(0);
+      this.discard = [top];
+      for (let i = this.draw.length - 1; i > 0; i--) {
+        const j = crypto.randomInt(i + 1);
+        [this.draw[i], this.draw[j]] = [this.draw[j], this.draw[i]];
+      }
+    }
+    return this.draw.pop();
+  }
+
+  playerFor(userId) {
+    return this.players.find(p => String(p.userId) === String(userId));
+  }
+
+  current() {
+    return this.players.find(p => p.seat === this.currentSeat);
+  }
+
+  nextSeat(steps = 1) {
+    const n = this.players.length;
+    let idx = this.players.findIndex(p => p.seat === this.currentSeat);
+    idx = (idx + this.direction * steps + n * 10) % n;
+    this.currentSeat = this.players[idx].seat;
+  }
+
+  advance(card) {
+    if (card?.type === 'reverse' && this.players.length === 2) {
+      this.nextSeat(2);
     } else {
-      emitRoom(
-        room
-      );
+      this.nextSeat(card?.type === 'reverse' ? 1 : card?.type === 'skip' ? 2 : 1);
     }
+    this.turnDeadline = now() + LIMITS.turnSeconds * 1000;
+  }
+
+  snapshotFor(userId) {
+    const me = this.playerFor(userId);
+    return {
+      id: this.id,
+      roomId: this.roomId,
+      mapId: this.mapId,
+      currentSeat: this.currentSeat,
+      direction: this.direction,
+      activeColor: this.activeColor,
+      topCard: this.discard[this.discard.length - 1],
+      drawCount: this.draw.length,
+      discardCount: this.discard.length,
+      turnRemainingMs: Math.max(0, this.turnDeadline - now()),
+      finished: this.finished,
+      winner: this.winner,
+      players: this.players.map(p => ({
+        seat: p.seat,
+        userId: p.userId,
+        isBot: p.isBot,
+        cardCount: p.hand.length,
+        disconnected: Boolean(p.disconnectedAt)
+      })),
+      hand: me ? me.hand : []
+    };
+  }
+
+  play(userId, cardIndex, chosenColor, nonce) {
+    const p = this.playerFor(userId);
+    if (!p || p.seat !== this.currentSeat || this.finished) throw new Error('NOT_YOUR_TURN');
+    if (!nonce || typeof nonce !== 'string' || nonce.length > 100) throw new Error('BAD_NONCE');
+    if (!Number.isInteger(cardIndex) || cardIndex < 0 || cardIndex >= p.hand.length) throw new Error('BAD_CARD');
+    const card = p.hand[cardIndex];
+    const top = this.discard[this.discard.length - 1];
+    if (!playable(card, top, this.activeColor)) throw new Error('INVALID_CARD');
+    if ((card.type === 'wild' || card.type === 'wild4') && !COLORS.includes(chosenColor)) throw new Error('BAD_COLOR');
+
+    p.hand.splice(cardIndex, 1);
+    this.discard.push(card);
+    this.activeColor = card.type === 'wild' || card.type === 'wild4' ? chosenColor : card.color;
+    this.lastActionAt = now();
+    this.sequence++;
+
+    if (p.hand.length === 0) {
+      this.finished = true;
+      this.winner = p.userId;
+      return card;
+    }
+
+    if (card.type === 'draw2') {
+      const next = this.nextPlayer();
+      for (let i = 0; i < 2; i++) next.hand.push(this.drawCard());
+      this.advance({ type: 'skip' });
+    } else if (card.type === 'wild4') {
+      const next = this.nextPlayer();
+      for (let i = 0; i < 4; i++) next.hand.push(this.drawCard());
+      this.advance({ type: 'skip' });
+    } else {
+      this.advance(card);
+    }
+    return card;
+  }
+
+  nextPlayer() {
+    const n = this.players.length;
+    let idx = this.players.findIndex(p => p.seat === this.currentSeat);
+    idx = (idx + this.direction + n) % n;
+    return this.players[idx];
+  }
+
+  drawFor(userId) {
+    const p = this.playerFor(userId);
+    if (!p || p.seat !== this.currentSeat || this.finished) throw new Error('NOT_YOUR_TURN');
+    const c = this.drawCard();
+    p.hand.push(c);
+    this.sequence++;
+    this.lastActionAt = now();
+    this.advance(null);
+    return c;
+  }
+
+  timeoutCurrent() {
+    if (this.finished || now() < this.turnDeadline) return null;
+    const p = this.current();
+    if (!p) return null;
+    p.missedTurns++;
+    try { this.drawFor(p.userId); } catch { this.advance(null); }
+    return p;
   }
 }
 
-/* =========================================================
-   UNO
-========================================================= */
-
-const COLORS = [
-  'red',
-  'yellow',
-  'green',
-  'blue'
-];
-
-function buildDeck() {
-  const deck = [];
-
-  for (
-    const color of COLORS
-  ) {
-    for (
-      let n = 0;
-      n <= 9;
-      n++
-    ) {
-      deck.push({
-        id:
-          crypto.randomUUID(),
-
-        color,
-
-        value:
-          String(n),
-
-        type:
-          'number'
-      });
-    }
-
-    deck.push({
-      id:
-        crypto.randomUUID(),
-
-      color,
-
-      value:
-        '🚫',
-
-      type:
-        'skip'
-    });
-
-    deck.push({
-      id:
-        crypto.randomUUID(),
-
-      color,
-
-      value:
-        '🔄',
-
-      type:
-        'reverse'
-    });
-
-    deck.push({
-      id:
-        crypto.randomUUID(),
-
-      color,
-
-      value:
-        '+2',
-
-      type:
-        'draw2'
-    });
-  }
-
-  for (
-    let i = 0;
-    i < 4;
-    i++
-  ) {
-    deck.push({
-      id:
-        crypto.randomUUID(),
-
-      color:
-        'black',
-
-      value:
-        '🌈',
-
-      type:
-        'wild'
-    });
-
-    deck.push({
-      id:
-        crypto.randomUUID(),
-
-      color:
-        'black',
-
-      value:
-        '+4',
-
-      type:
-        'draw4'
-    });
-  }
-
-  for (
-    let i =
-      deck.length - 1;
-    i > 0;
-    i--
-  ) {
-    const j =
-      Math.floor(
-        Math.random() *
-          (i + 1)
-      );
-
-    [
-      deck[i],
-      deck[j]
-    ] = [
-      deck[j],
-      deck[i]
-    ];
-  }
-
-  return deck;
+async function persistAction(matchId, userId, type, payload, accepted, reason = null, nonce = null) {
+  await pool.query(`
+    INSERT INTO match_actions(match_id,user_id,sequence,nonce,action_type,payload,accepted,reject_reason)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT (match_id, sequence) DO NOTHING
+  `, [
+    matchId, userId, payload.sequence || 0, nonce || uuid(), type,
+    JSON.stringify(payload), accepted, reason
+  ]);
 }
 
-function playable(
-  card,
-  top,
-  currentColor
-) {
-  return (
-    card.color ===
-      'black' ||
-    card.color ===
-      currentColor ||
-    card.value ===
-      top.value
+
+async function startMatch(roomId) {
+  const existing = await pool.query(
+    `SELECT id FROM matches WHERE room_id=$1 AND status='running' LIMIT 1`, [roomId]
   );
+  if (existing.rowCount) return rooms.get(String(existing.rows[0].id));
+
+  const rr = await pool.query(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+  if (!rr.rowCount) throw new Error('ROOM_NOT_FOUND');
+  const room = rr.rows[0];
+
+  const pr = await pool.query(`
+    SELECT room_id,user_id,seat,is_bot
+    FROM room_players
+    WHERE room_id=$1
+    ORDER BY seat
+  `, [roomId]);
+
+  const humanCount = pr.rows.filter(x => !x.is_bot).length;
+  const shouldStart = room.mode === 'solo'
+    ? humanCount >= 1
+    : pr.rowCount >= room.max_players;
+  if (!shouldStart) return null;
+
+  const matchId = uuid();
+  const match = new UnoMatch(matchId, room, pr.rows);
+  await pool.query(`
+    INSERT INTO matches(id,room_id,mode,map_id,status,current_turn_seat,current_color,turn_deadline_at)
+    VALUES($1,$2,$3,$4,'running',$5,$6,to_timestamp($7/1000.0))
+  `, [matchId, roomId, room.mode, room.map_id, match.currentSeat, match.activeColor, match.turnDeadline]);
+
+  for (const p of match.players) {
+    await pool.query(`
+      INSERT INTO match_players(match_id,user_id,seat,is_bot,card_count)
+      VALUES($1,$2,$3,$4,$5)
+    `, [matchId, p.userId, p.seat, p.isBot, p.hand.length]);
+  }
+
+  await pool.query(`UPDATE rooms SET status='playing',last_activity_at=now() WHERE id=$1`, [roomId]);
+  rooms.set(matchId, match);
+  return match;
 }
 
-function startRoomGame(
-  room
-) {
-  room.started =
-    true;
+/* ----------------------------- HTTP API --------------------------------- */
 
-  room.locked =
-    true;
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, service: 'Uno50', database: 'ok', version: '1.2.0 V2026' });
+  } catch {
+    res.status(503).json({ ok: false, service: 'Uno50', database: 'error' });
+  }
+});
 
-  const deck =
-    buildDeck();
+app.post('/api/auth/register', async (req, res) => {
+  if (!rate(`register:${req.ip}`, 5, 60_000)) return res.status(429).json({ error: 'RATE_LIMIT' });
+  const { username, password, email } = req.body || {};
+  if (!validUsername(username) || !validPassword(password)) {
+    return res.status(400).json({ error: 'INVALID_CREDENTIALS' });
+  }
+  const hash = await bcrypt.hash(password, 12);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const u = await client.query(`
+      INSERT INTO users(username,email,password_hash)
+      VALUES($1,$2,$3) RETURNING id,username,email
+    `, [username.trim(), email ? String(email).trim().slice(0,254) : null, hash]);
+    await client.query('INSERT INTO profiles(user_id,avatar_id) VALUES($1,1)', [u.rows[0].id]);
+    await client.query('COMMIT');
+    res.status(201).json({ token: sign(u.rows[0]), user: await userById(u.rows[0].id) });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') return res.status(409).json({ error: 'USERNAME_OR_EMAIL_EXISTS' });
+    console.error(e);
+    res.status(500).json({ error: 'REGISTER_FAILED' });
+  } finally { client.release(); }
+});
 
-  room.game = {
-    deck,
+app.post('/api/auth/login', async (req, res) => {
+  if (!rate(`login:${req.ip}`, 10, 60_000)) return res.status(429).json({ error: 'RATE_LIMIT' });
+  const { username, password, platform } = req.body || {};
+  if (!validUsername(username) || typeof password !== 'string') return res.status(400).json({ error: 'INVALID_LOGIN' });
 
-    discard: [],
+  const r = await pool.query(`
+    SELECT u.id,u.username,u.email,u.password_hash,u.is_active,u.is_banned
+    FROM users u WHERE u.username=$1
+  `, [username.trim()]);
+  const u = r.rows[0];
+  if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ error: 'INVALID_LOGIN' });
+  if (!u.is_active || u.is_banned) return res.status(403).json({ error: 'ACCOUNT_BLOCKED' });
 
-    currentColor:
-      null,
+  if (platform && validPlatform(platform)) {
+    await pool.query('UPDATE profiles SET platform=$1,updated_at=now() WHERE user_id=$2', [platform, u.id]);
+  } else {
+    await pool.query('UPDATE profiles SET platform=NULL,updated_at=now() WHERE user_id=$1', [u.id]);
+  }
+  await pool.query('UPDATE users SET last_login_at=now(),last_seen_at=now() WHERE id=$1', [u.id]);
+  res.json({ token: sign(u), user: await userById(u.id), platformRequired: !platform });
+});
 
-    currentIndex:
-      0,
+app.post('/api/auth/recovery', (_req, res) => {
+  res.status(503).json({ error: 'PASSWORD_RECOVERY_UNAVAILABLE' });
+});
 
-    direction:
-      1,
+app.get('/api/me', auth, async (req, res) => {
+  const u = await userById(req.user.sub);
+  if (!u || u.is_banned || !u.is_active) return res.status(403).json({ error: 'ACCOUNT_BLOCKED' });
+  await pool.query('UPDATE users SET last_seen_at=now() WHERE id=$1', [u.id]);
+  res.json({ user: u });
+});
 
-    pendingDraw:
-      0,
+app.put('/api/profile', auth, async (req, res) => {
+  const { avatarId, platform, brightness, soundEnabled, reducedAnimations } = req.body || {};
+  if (avatarId !== undefined && (!Number.isInteger(avatarId) || avatarId < 1 || avatarId > 10)) return res.status(400).json({ error:'BAD_AVATAR' });
+  if (platform !== undefined && !validPlatform(platform)) return res.status(400).json({ error:'BAD_PLATFORM' });
+  if (brightness !== undefined && (!Number.isInteger(brightness) || brightness < 30 || brightness > 100)) return res.status(400).json({ error:'BAD_BRIGHTNESS' });
+  await pool.query(`
+    UPDATE profiles SET
+      avatar_id=COALESCE($1,avatar_id),
+      platform=COALESCE($2,platform),
+      brightness=COALESCE($3,brightness),
+      sound_enabled=COALESCE($4,sound_enabled),
+      reduced_animations=COALESCE($5,reduced_animations),
+      updated_at=now()
+    WHERE user_id=$6
+  `, [avatarId ?? null, platform ?? null, brightness ?? null, soundEnabled ?? null, reducedAnimations ?? null, req.user.sub]);
+  res.json({ user: await userById(req.user.sub) });
+});
 
-    startedAt:
-      Date.now(),
+app.get('/api/rooms', auth, async (_req, res) => {
+  const r = await pool.query(`
+    SELECT r.*, COUNT(rp.user_id)::int AS players,
+           CASE r.mode WHEN 'solo' THEN 1 WHEN 'duo' THEN 2 ELSE 3 END AS max_players
+    FROM rooms r
+    LEFT JOIN room_players rp ON rp.room_id=r.id
+    WHERE r.visibility='public' AND r.status='waiting'
+    GROUP BY r.id
+    ORDER BY r.created_at DESC
+    LIMIT 50
+  `);
+  res.json({ rooms: r.rows.map(publicRoom) });
+});
 
-    lastAction:
-      Date.now(),
+app.post('/api/rooms', auth, async (req, res) => {
+  if (await banned(req.user.sub)) return res.status(403).json({ error:'ACCOUNT_BLOCKED' });
+  if (!rate(`room:${req.user.sub}`, 5, 60_000)) return res.status(429).json({ error:'RATE_LIMIT' });
+  const { name, password, visibility='public', mode='solo', bots=false, mapId='pirate_ship', description='' } = req.body || {};
+  if (typeof name !== 'string' || name.trim().length < 1 || name.trim().length > 40) return res.status(400).json({error:'BAD_ROOM_NAME'});
+  if (!['public','private'].includes(visibility) || !validMode(mode)) return res.status(400).json({error:'BAD_ROOM_SETTINGS'});
+  const allowedMaps = ['pirate_ship','ancient_egypt','ancient_rome','edo_japan','silk_road'];
+  if (!allowedMaps.includes(mapId)) return res.status(400).json({error:'BAD_MAP'});
+  if (visibility === 'private' && password && String(password).length > 128) return res.status(400).json({error:'BAD_PASSWORD'});
+  const id = uuid();
+  let roomCode;
+  for (let i=0;i<10;i++) {
+    const c = code();
+    const exists = await pool.query('SELECT 1 FROM rooms WHERE code=$1',[c]);
+    if (!exists.rowCount) { roomCode=c; break; }
+  }
+  if (!roomCode) return res.status(500).json({error:'CODE_GENERATION_FAILED'});
+  const hash = password ? await bcrypt.hash(String(password), 12) : null;
+  const max = maxPlayers(mode);
+  await pool.query(`
+    INSERT INTO rooms(id,code,owner_id,name,password_hash,visibility,mode,bots,map_id,description,max_players)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+  `, [id,roomCode,req.user.sub,name.trim(),hash,visibility,mode,Boolean(bots),mapId,String(description).slice(0,300),max]);
+  await pool.query('INSERT INTO room_players(room_id,user_id,seat,is_bot) VALUES($1,$2,1,FALSE)', [id, req.user.sub]);
+  if (mode === 'solo' && bots) await pool.query('INSERT INTO room_players(room_id,user_id,seat,is_bot) VALUES($1,NULL,2,TRUE)', [id]);
+  const started = await startMatch(id);
+  res.status(201).json({ code: roomCode, roomId: id, matchId: started?.id || null });
+});
 
-    winner:
-      null,
+app.post('/api/rooms/:code/join', auth, async (req, res) => {
+  if (await banned(req.user.sub)) return res.status(403).json({ error: 'ACCOUNT_BLOCKED' });
+  const c = String(req.params.code).toUpperCase();
+  const { password } = req.body || {};
+  const r = await pool.query('SELECT * FROM rooms WHERE code=$1 AND status=$2',[c,'waiting']);
+  if (!r.rowCount) return res.status(404).json({error:'ROOM_NOT_FOUND'});
+  const room = r.rows[0];
+  if (room.visibility === 'private') {
+    if (!room.password_hash || typeof password !== 'string' || !(await bcrypt.compare(password, room.password_hash))) return res.status(403).json({error:'ROOM_PASSWORD_INVALID'});
+  }
+  const count = await pool.query('SELECT COUNT(*)::int AS n FROM room_players WHERE room_id=$1',[room.id]);
+  if (Number(count.rows[0].n) >= room.max_players) return res.status(409).json({error:'ROOM_FULL'});
+  const occupied = await pool.query('SELECT seat FROM room_players WHERE room_id=$1 ORDER BY seat',[room.id]);
+  const used = new Set(occupied.rows.map(x=>Number(x.seat)));
+  let seat=1; while(used.has(seat)) seat++;
+  await pool.query('INSERT INTO room_players(room_id,user_id,seat,is_bot) VALUES($1,$2,$3,FALSE)',[room.id,req.user.sub,seat]);
+  const started = await startMatch(room.id);
+  res.json({ ok:true, code:c, seat, matchId: started?.id || null });
+});
 
-    matchId:
-      crypto.randomUUID(),
+app.post('/api/rooms/:code/leave', auth, async (req,res) => {
+  const c=String(req.params.code).toUpperCase();
+  await pool.query(`
+    DELETE FROM room_players rp USING rooms r
+    WHERE rp.room_id=r.id AND r.code=$1 AND rp.user_id=$2
+  `,[c,req.user.sub]);
+  res.json({ok:true});
+});
 
-    challenges:
-      new Map()
-  };
+app.post('/api/reports', auth, async (req,res)=>{
+  const { targetUserId, roomId, reason, details='' }=req.body||{};
+  if(!Number.isInteger(Number(targetUserId)) || typeof reason!=='string' || reason.length<2) return res.status(400).json({error:'BAD_REPORT'});
+  if(!rate(`report:${req.user.sub}`,5,3600000)) return res.status(429).json({error:'RATE_LIMIT'});
+  await pool.query(`
+    INSERT INTO reports(reporter_user_id,reported_user_id,room_id,reason,details)
+    VALUES($1,$2,$3,$4,$5)
+  `,[req.user.sub,Number(targetUserId),roomId||null,reason.slice(0,32),String(details).slice(0,500)]);
+  res.status(201).json({ok:true});
+});
 
-  room.players.forEach(
-    p => {
-      p.hand = [];
+app.get('/api/admin/reports', auth, async (req,res)=>{
+  const u=await userById(req.user.sub);
+  if(!u?.leader_badge) return res.status(403).json({error:'FORBIDDEN'});
+  const r=await pool.query(`
+    SELECT id,reporter_user_id,reported_user_id,room_id,reason,details,status,created_at
+    FROM reports ORDER BY created_at DESC LIMIT 100
+  `);
+  res.json({reports:r.rows});
+});
+
+app.post('/api/admin/moderation', auth, async (req,res)=>{
+  const u=await userById(req.user.sub);
+  if(!u?.leader_badge) return res.status(403).json({error:'FORBIDDEN'});
+  const {targetUserId,action,reason,durationSeconds}=req.body||{};
+  const allowed=['warning','mute','kick','temporary_ban','permanent_ban'];
+  if(!allowed.includes(action) || !Number.isInteger(Number(targetUserId)) || typeof reason!=='string') return res.status(400).json({error:'BAD_MODERATION'});
+  await pool.query(`
+    INSERT INTO moderation_actions(moderator_user_id,target_user_id,action_type,reason,duration_seconds)
+    VALUES($1,$2,$3,$4,$5)
+  `,[req.user.sub,Number(targetUserId),action,reason.slice(0,300),durationSeconds||null]);
+  if(action==='permanent_ban') await pool.query('UPDATE users SET is_banned=TRUE WHERE id=$1',[targetUserId]);
+  if(action==='temporary_ban') {
+    await pool.query('UPDATE users SET is_active=FALSE WHERE id=$1',[targetUserId]);
+  }
+  res.json({ok:true});
+});
+
+/* --------------------------- WebSocket ---------------------------------- */
+
+const server=http.createServer(app);
+const wss=new WebSocketServer({server});
+const wsMeta=new WeakMap();
+
+function send(ws,obj) {
+  if(ws.readyState===1) ws.send(JSON.stringify(obj));
+}
+function broadcastMatch(matchId) {
+  for(const ws of sockets){
+    const meta=wsMeta.get(ws);
+    if(meta?.matchId===matchId) {
+      const m=rooms.get(matchId);
+      if(m) send(ws,{type:'state',data:m.snapshotFor(meta.userId)});
     }
-  );
+  }
+}
+function wsRate(meta,type){
+  const t=now();
+  const arr=meta.rate[type]||[];
+  const windowMs=type==='chat'?10000:1000;
+  const limit=type==='chat'?LIMITS.chatPer10Seconds:LIMITS.actionPerSecond;
+  meta.rate[type]=arr.filter(x=>t-x<windowMs);
+  if(meta.rate[type].length>=limit)return false;
+  meta.rate[type].push(t);return true;
+}
 
-  for (
-    let n = 0;
-    n <
-      room.options
-        .startingCards;
-    n++
-  ) {
-    for (
-      const p of
-        room.players
-    ) {
-      if (
-        deck.length
-      ) {
-        p.hand.push(
-          deck.pop()
+wss.on('connection',(ws,req)=>{
+  const url=new URL(req.url,'http://localhost');
+  const token=url.searchParams.get('token');
+  let claims;
+  try { claims=jwt.verify(token||'',JWT_SECRET); } catch { ws.close(1008,'INVALID_TOKEN'); return; }
+  const meta={userId:Number(claims.sub),matchId:null,rate:{action:[],chat:[]}};
+  wsMeta.set(ws,meta); sockets.add(ws);
+  send(ws,{type:'connected',data:{version:'1.2.0 V2026'}});
+
+  ws.on('message',async raw=>{
+    if(raw.length>8192){ws.close(1009,'MESSAGE_TOO_LARGE');return;}
+    let msg;try{msg=JSON.parse(raw.toString())}catch{send(ws,{type:'error',error:'BAD_JSON'});return;}
+    try{
+      if(await banned(meta.userId)){ws.close(1008,'ACCOUNT_BLOCKED');return;}
+      if(msg.type==='join_match'){
+        const matchId=String(msg.matchId||'');
+        const match=rooms.get(matchId);
+        if(!match) {send(ws,{type:'error',error:'MATCH_NOT_FOUND'});return;}
+        if(!match.playerFor(meta.userId)){send(ws,{type:'error',error:'NOT_IN_MATCH'});return;}
+        meta.matchId=matchId;
+        send(ws,{type:'state',data:match.snapshotFor(meta.userId)});
+        return;
+      }
+      if(!meta.matchId){send(ws,{type:'error',error:'JOIN_MATCH_FIRST'});return;}
+      const match=rooms.get(meta.matchId);
+      if(!match){send(ws,{type:'error',error:'MATCH_NOT_FOUND'});return;}
+
+      if(msg.type==='chat'){
+        if(!wsRate(meta,'chat')){send(ws,{type:'error',error:'RATE_LIMIT'});return;}
+        const text=String(msg.text||'').trim();
+        if(!text || text.length>LIMITS.maxMessageLength){send(ws,{type:'error',error:'BAD_MESSAGE'});return;}
+        await pool.query('INSERT INTO chat_messages(match_id,user_id,message) VALUES($1,$2,$3)',[match.id,meta.userId,text]);
+        for(const peer of sockets){const pm=wsMeta.get(peer);if(pm?.matchId===match.id)send(peer,{type:'chat',data:{userId:meta.userId,message:text}});}
+        return;
+      }
+
+      if(!wsRate(meta,'action')){send(ws,{type:'error',error:'RATE_LIMIT'});return;}
+      const nonce=String(msg.nonce||'');
+      if(!nonce || nonce.length>100){send(ws,{type:'error',error:'BAD_NONCE'});return;}
+      let result;
+      try{
+        if(msg.type==='play') result=match.play(meta.userId,Number(msg.cardIndex),msg.chosenColor,nonce);
+        else if(msg.type==='draw') result=match.drawFor(meta.userId);
+        else if(msg.type==='uno') result={ok:true};
+        else {send(ws,{type:'error',error:'UNKNOWN_ACTION'});return;}
+      }catch(e){
+        await pool.query(`
+          INSERT INTO match_actions(match_id,user_id,sequence,nonce,action_type,payload,accepted,reject_reason)
+          VALUES($1,$2,$3,$4,$5,$6,FALSE,$7)
+          ON CONFLICT (match_id,nonce) DO NOTHING
+        `,[match.id,meta.userId,match.sequence,nonce,msg.type,JSON.stringify(msg),e.message]);
+        send(ws,{type:'error',error:e.message});return;
+      }
+
+      await pool.query(`
+        INSERT INTO match_actions(match_id,user_id,sequence,nonce,action_type,payload,accepted)
+        VALUES($1,$2,$3,$4,$5,$6,TRUE)
+        ON CONFLICT (match_id,nonce) DO NOTHING
+      `,[match.id,meta.userId,match.sequence,nonce,msg.type,JSON.stringify({sequence:match.sequence})]);
+
+      await pool.query(`
+        UPDATE matches
+        SET current_turn_seat=$1,current_color=$2,
+            turn_deadline_at=to_timestamp($3/1000.0)
+        WHERE id=$4
+      `,[match.currentSeat,match.activeColor,match.turnDeadline,match.id]);
+      for(const p of match.players){
+        await pool.query(
+          'UPDATE match_players SET card_count=$1 WHERE match_id=$2 AND seat=$3',
+          [p.hand.length,match.id,p.seat]
         );
       }
-    }
-  }
+      await pool.query('UPDATE rooms SET last_activity_at=now() WHERE id=$1',[match.roomId]);
+      if(match.finished){
+        await pool.query('UPDATE matches SET status=$1,winner_id=$2,ended_at=now() WHERE id=$3',['finished',match.winner,match.id]);
+        await pool.query('UPDATE rooms SET status=$1,last_activity_at=now() WHERE id=$2',['finished',match.roomId]);
+      }
+      broadcastMatch(match.id);
+      void result;
+    }catch(e){console.error('WS error',e);send(ws,{type:'error',error:'SERVER_ERROR'});}
+  });
 
-  let top;
+  ws.on('close',()=>sockets.delete(ws));
+});
 
-  do {
-    top =
-      deck.pop();
-  } while (
-    top &&
-    top.color ===
-      'black'
-  );
-
-  room.game.discard = [
-    top
-  ];
-
-  room.game.currentColor =
-    top.color;
-
-  emitGame(
-    room
-  );
-
-  if (
-    room.players[
-      room.game
-        .currentIndex
-    ]?.isBot
-  ) {
-    setTimeout(
-      () =>
-        botTurn(
-          room
-        ),
-      900
-    );
-  }
-}
-
-function safeGameFor(
-  player,
-  room
-) {
-  const g =
-    room.game;
-
-  return {
-    code:
-      room.code,
-
-    players:
-      room.players.map(
-        p => ({
-          userId:
-            p.userId,
-
-          username:
-            p.username,
-
-          role:
-            p.role,
-
-          connected:
-            p.connected,
-
-          isBot:
-            p.isBot,
-
-          cardCount:
-            p.hand.length,
-
-          avatar:
-            p.avatar
-        })
-      ),
-
-    top:
-      g.discard[
-        g.discard.length -
-          1
-      ],
-
-    currentColor:
-      g.currentColor,
-
-    currentPlayerId:
-      room.players[
-        g.currentIndex
-      ]?.userId,
-
-    direction:
-      g.direction,
-
-    pendingDraw:
-      g.pendingDraw,
-
-    deckCount:
-      g.deck.length,
-
-    hand:
-      player?.hand ||
-      [],
-
-    mapId:
-      room.options
-        .mapId,
-
-    deckId:
-      room.options
-        .deckId,
-
-    startedAt:
-      g.startedAt,
-
-    turnSeconds:
-      room.options
-        .turnSeconds,
-
-    winner:
-      g.winner
-  };
-}
-
-function emitGame(
-  room
-) {
-  for (
-    const p of
-      room.players
-  ) {
-    if (
-      p.isBot
-    ) {
+setInterval(async()=>{
+  for(const [matchId,match] of rooms){
+    if(match.finished) continue;
+    if(now()-match.startedAt>LIMITS.maxMatchSeconds*1000){
+      match.finished=true;
+      await pool.query('UPDATE matches SET status=$1,ended_at=now(),abort_reason=$2 WHERE id=$3',['aborted','MATCH_TIMEOUT',matchId]).catch(()=>{});
+      broadcastMatch(matchId);
       continue;
     }
-
-    for (
-      const [
-        sid,
-        u
-      ] of socketUsers
-    ) {
-      if (
-        u.userId ===
-        p.userId
-      ) {
-        io
-          .to(sid)
-          .emit(
-            'game:state',
-            safeGameFor(
-              p,
-              room
-            )
-          );
-      }
+    const timed=match.timeoutCurrent();
+    if(timed){
+      await pool.query('UPDATE room_players SET missed_turns=missed_turns+1,last_seen_at=now() WHERE room_id=$1 AND user_id=$2',[match.roomId,timed.userId]).catch(()=>{});
+      broadcastMatch(matchId);
     }
   }
-}
-
-function nextIndex(
-  room,
-  steps = 1
-) {
-  const g =
-    room.game;
-
-  let i =
-    g.currentIndex;
-
-  for (
-    let n = 0;
-    n < steps;
-    n++
-  ) {
-    do {
-      i =
-        (
-          i +
-          g.direction +
-          room.players.length
-        ) %
-        room.players.length;
-    } while (
-      room.players[i] &&
-      !room.players[i]
-        .connected &&
-      n <
-        room.players
-          .length
-    );
-  }
-
-  return i;
-}
-
-function drawCards(
-  room,
-  player,
-  count
-) {
-  for (
-    let i = 0;
-    i < count;
-    i++
-  ) {
-    if (
-      !room.game
-        .deck.length
-    ) {
-      const top =
-        room.game
-          .discard
-          .pop();
-
-      room.game.deck =
-        room.game
-          .discard
-          .splice(0);
-
-      room.game.discard =
-        [top];
-
-      for (
-        let j =
-          room.game
-            .deck.length -
-          1;
-        j > 0;
-        j--
-      ) {
-        const k =
-          Math.floor(
-            Math.random() *
-              (j + 1)
-          );
-
-        [
-          room.game
-            .deck[j],
-          room.game
-            .deck[k]
-        ] = [
-          room.game
-            .deck[k],
-          room.game
-            .deck[j]
-        ];
-      }
-    }
-
-    if (
-      room.game
-        .deck.length
-    ) {
-      player.hand.push(
-        room.game
-          .deck
-          .pop()
-      );
-    }
-  }
-}
-
-function applyCard(
-  room,
-  player,
-  card,
-  chosenColor
-) {
-  const g =
-    room.game;
-
-  g.discard.push(
-    card
-  );
-
-  g.currentColor =
-    card.color ===
-    'black'
-      ? (
-          COLORS.includes(
-            chosenColor
-          )
-            ? chosenColor
-            : COLORS[
-                Math.floor(
-                  Math.random() *
-                    4
-                )
-              ]
-        )
-      : card.color;
-
-  g.pendingDraw =
-    0;
-
-  if (
-    card.type ===
-    'draw2'
-  ) {
-    g.pendingDraw =
-      2;
-  }
-
-  if (
-    card.type ===
-    'draw4'
-  ) {
-    g.pendingDraw =
-      4;
-  }
-
-  if (
-    card.type ===
-      'reverse' &&
-    room.players.length >
-      2
-  ) {
-    g.direction *=
-      -1;
-  }
-
-  const skip =
-    card.type ===
-      'skip' ||
-    (
-      card.type ===
-        'reverse' &&
-      room.players.length ===
-        2
-    );
-
-  g.currentIndex =
-    nextIndex(
-      room,
-      skip ? 2 : 1
-    );
-}
-
-function turnAllowed(
-  room,
-  userId
-) {
-  return (
-    !globalState.paused &&
-    room.started &&
-    room.players[
-      room.game
-        .currentIndex
-    ]?.userId ===
-      userId
-  );
-}
-
-/* =========================================================
-   BOT
-========================================================= */
-
-function botTurn(
-  room
-) {
-  if (
-    !room.started ||
-    room.game.winner ||
-    globalState.paused
-  ) {
-    return;
-  }
-
-  const p =
-    room.players[
-      room.game
-        .currentIndex
-    ];
-
-  if (!p?.isBot) {
-    return;
-  }
-
-  let candidates =
-    p.hand.filter(
-      c =>
-        playable(
-          c,
-          room.game
-            .discard
-            .at(-1),
-          room.game
-            .currentColor
-        )
-    );
-
-  if (
-    room.game
-      .pendingDraw > 0 &&
-    !room.options
-      .stackDraw
-  ) {
-    candidates = [];
-  }
-
-  const card =
-    candidates.sort(
-      (a, b) =>
-        scoreCard(b) -
-        scoreCard(a)
-    )[0];
-
-  if (!card) {
-    drawCards(
-      room,
-      p,
-      room.game
-        .pendingDraw ||
-        1
-    );
-
-    room.game
-      .pendingDraw = 0;
-
-    room.game
-      .currentIndex =
-      nextIndex(
-        room,
-        1
-      );
-
-    emitGame(
-      room
-    );
-
-    setTimeout(
-      () =>
-        botTurn(
-          room
-        ),
-      800
-    );
-
-    return;
-  }
-
-  p.hand.splice(
-    p.hand.indexOf(
-      card
-    ),
-    1
-  );
-
-  const color =
-    card.color ===
-    'black'
-      ? chooseBotColor(
-          p.hand
-        )
-      : null;
-
-  applyCard(
-    room,
-    p,
-    card,
-    color
-  );
-
-  checkRoomWinner(
-    room,
-    p
-  );
-
-  emitGame(
-    room
-  );
-
-  if (
-    room.started &&
-    room.players[
-      room.game
-        .currentIndex
-    ]?.isBot
-  ) {
-    setTimeout(
-      () =>
-        botTurn(
-          room
-        ),
-      900
-    );
-  }
-}
-
-function scoreCard(
-  c
-) {
-  if (
-    c.type ===
-    'draw4'
-  ) {
-    return 100;
-  }
-
-  if (
-    c.type ===
-    'draw2'
-  ) {
-    return 80;
-  }
-
-  if (
-    c.type ===
-    'wild'
-  ) {
-    return 70;
-  }
-
-  if (
-    c.type ===
-    'skip'
-  ) {
-    return 40;
-  }
-
-  if (
-    c.type ===
-    'reverse'
-  ) {
-    return 35;
-  }
-
-  return 10;
-}
-
-function chooseBotColor(
-  hand
-) {
-  const counts = {
-    red: 0,
-    yellow: 0,
-    green: 0,
-    blue: 0
-  };
-
-  hand.forEach(
-    c => {
-      if (
-        counts[c.color] !=
-        null
-      ) {
-        counts[
-          c.color
-        ]++;
-      }
-    }
-  );
-
-  return Object.entries(
-    counts
-  ).sort(
-    (a, b) =>
-      b[1] -
-      a[1]
-  )[0][0];
-}
-
-/* =========================================================
-   FINAL DA PARTIDA
-========================================================= */
-
-async function checkRoomWinner(
-  room,
-  player
-) {
-  if (
-    player.hand.length !==
-    0
-  ) {
-    return;
-  }
-
-  room.game.winner =
-    player.userId;
-
-  room.started =
-    false;
-
-  room.locked =
-    false;
-
-  const realPlayers =
-    room.players.filter(
-      p => !p.isBot
-    );
-
-  for (
-    const p of
-      realPlayers
-  ) {
-    const win =
-      String(
-        p.userId
-      ) ===
-      String(
-        player.userId
-      );
-
-    await finishMatchPlayer(
-      p,
-      room,
-      win
-    );
-  }
-
-  emitGame(
-    room
-  );
-
-  emitRoom(
-    room
-  );
-
-  io
-    .to(
-      `room:${room.code}`
-    )
-    .emit(
-      'game:winner',
-      {
-        username:
-          player.username,
-
-        userId:
-          player.userId
-      }
-    );
-}
-
-async function finishMatchPlayer(
-  p,
-  room,
-  win
-) {
-  if (
-    !usePostgres ||
-    p.isBot
-  ) {
-    return;
-  }
-
-  const coins =
-    win ? 150 : 25;
-
-  const xp =
-    win ? 250 : 60;
-
-  try {
-    await pool.query(
-      'BEGIN'
-    );
-
-    const current =
-      await pool.query(
-        `
-          SELECT xp
-          FROM users
-          WHERE id=$1
-        `,
-        [p.userId]
-      );
-
-    const currentXp =
-      Number(
-        current.rows[0]
-          ?.xp || 0
-      );
-
-    const newLevel =
-      levelForXp(
-        currentXp + xp
-      );
-
-    await pool.query(
-      `
-        UPDATE users
-
-        SET
-          coins=coins+$1,
-          xp=xp+$2,
-          level=LEAST(
-            100,
-            $3
-          ),
-          wins=wins+$4,
-          losses=losses+$5,
-          games_played=
-            games_played+1
-
-        WHERE id=$6
-      `,
-      [
-        coins,
-        xp,
-        newLevel,
-        win ? 1 : 0,
-        win ? 0 : 1,
-        p.userId
-      ]
-    );
-
-    await pool.query(
-      'COMMIT'
-    );
-  } catch {
-    try {
-      await pool.query(
-        'ROLLBACK'
-      );
-    } catch {}
-  }
-}
-
-/* =========================================================
-   SOCKET.IO
-========================================================= */
-
-io.use(
-  async (
-    socket,
-    next
-  ) => {
-    try {
-      const token =
-        socket.handshake
-          .auth?.token ||
-        parseCookies({
-          headers:
-            socket
-              .handshake
-              .headers
-        }).uv_session;
-
-      const payload =
-        token &&
-        verifyToken(
-          token
-        );
-
-      if (!payload) {
-        return next(
-          new Error(
-            'unauthorized'
-          )
-        );
-      }
-
-      const user =
-        await getUserById(
-          payload.id
-        );
-
-      if (!user) {
-        return next(
-          new Error(
-            'unauthorized'
-          )
-        );
-      }
-
-      const mod =
-        await activeModeration(
-          user.id
-        );
-
-      if (
-        mod?.action ===
-        'ban'
-      ) {
-        return next(
-          new Error(
-            'banned'
-          )
-        );
-      }
-
-      socketUsers.set(
-        socket.id,
-        {
-          userId:
-            user.id,
-
-          username:
-            user.username,
-
-          role:
-            user.role
-        }
-      );
-
-      socket.user =
-        user;
-
-      next();
-    } catch (err) {
-      next(
-        new Error(
-          'unauthorized'
-        )
-      );
-    }
-  }
-);
-
-io.on(
-  'connection',
-  socket => {
-    const me =
-      socket.user;
-
-    console.log(
-      '🔌 Socket conectado:',
-      me.username
-    );
-
-    socket.on(
-      'room:join',
-      async ({
-        code,
-        password
-      } = {}) => {
-        const room =
-          rooms.get(
-            String(
-              code || ''
-            ).toUpperCase()
-          );
-
-        if (!room) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Sala não encontrada.'
-            }
-          );
-        }
-
-        if (room.started) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Partida já iniciada.'
-            }
-          );
-        }
-
-        if (
-          room.password &&
-          room.password !==
-            String(
-              password ||
-                ''
-            )
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Senha incorreta.'
-            }
-          );
-        }
-
-        if (
-          room.players.length >=
-          room.options
-            .maxPlayers
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Sala cheia.'
-            }
-          );
-        }
-
-        if (
-          !room.players.some(
-            p =>
-              p.userId ===
-              me.id
-          )
-        ) {
-          room.players.push(
-            makeRoomPlayer(
-              me
-            )
-          );
-        }
-
-        socket.join(
-          `room:${room.code}`
-        );
-
-        emitRoom(
-          room
-        );
-
-        socket.emit(
-          'room:joined',
-          roomSummary(
-            room
-          )
-        );
-      }
-    );
-
-    socket.on(
-      'room:leave',
-      () => {
-        for (
-          const room of
-            rooms.values()
-        ) {
-          if (
-            room.players.some(
-              p =>
-                p.userId ===
-                me.id
-            )
-          ) {
-            socket.leave(
-              `room:${room.code}`
-            );
-
-            removePlayer(
-              room,
-              me.id
-            );
-          }
-        }
-      }
-    );
-
-    socket.on(
-      'room:start',
-      () => {
-        for (
-          const room of
-            rooms.values()
-        ) {
-          if (
-            room.ownerId ===
-              me.id &&
-            room.players.some(
-              p =>
-                p.userId ===
-                me.id
-            )
-          ) {
-            if (
-              room.players
-                .length < 2 &&
-              !room.options
-                .allowBots
-            ) {
-              return socket.emit(
-                'toast',
-                {
-                  type:
-                    'error',
-                  message:
-                    'Adicione outro jogador ou permita bots.'
-                }
-              );
-            }
-
-            if (
-              globalState.paused
-            ) {
-              return socket.emit(
-                'toast',
-                {
-                  type:
-                    'error',
-                  message:
-                    globalState.message
-                }
-              );
-            }
-
-            if (
-              room.options
-                .allowBots
-            ) {
-              while (
-                room.players
-                  .length <
-                  room.options
-                    .maxPlayers &&
-                room.players
-                  .length <
-                  room.options
-                    .botFill
-              ) {
-                room.players.push(
-                  makeBotPlayer(
-                    room.players
-                      .length
-                  )
-                );
-              }
-            }
-
-            if (
-              room.players
-                .length < 2
-            ) {
-              return socket.emit(
-                'toast',
-                {
-                  type:
-                    'error',
-                  message:
-                    'Não foi possível preencher a sala.'
-                }
-              );
-            }
-
-            startRoomGame(
-              room
-            );
-
-            emitRoom(
-              room
-            );
-
-            return;
-          }
-        }
-      }
-    );
-
-    /* =====================================================
-       JOGAR CARTA
-    ===================================================== */
-
-    socket.on(
-      'game:play',
-      async ({
-        cardId,
-        chosenColor,
-        answer
-      } = {}) => {
-        const room =
-          findPlayerRoom(
-            me.id
-          );
-
-        if (!room) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Você não está em uma sala.'
-            }
-          );
-        }
-
-        if (
-          !turnAllowed(
-            room,
-            me.id
-          )
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Não é sua vez.'
-            }
-          );
-        }
-
-        const p =
-          room.players.find(
-            x =>
-              x.userId ===
-              me.id
-          );
-
-        const index =
-          p.hand.findIndex(
-            c =>
-              c.id ===
-                cardId ||
-              c._clientId ===
-                cardId
-          );
-
-        if (
-          index < 0
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Carta inválida.'
-            }
-          );
-        }
-
-        const card =
-          p.hand[index];
-
-        if (
-          !playable(
-            card,
-            room.game
-              .discard
-              .at(-1),
-            room.game
-              .currentColor
-          )
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Carta não pode ser jogada.'
-            }
-          );
-        }
-
-        /*
-         * Desafio matemático.
-         */
-        const key =
-          `${me.id}:${card.id}`;
-
-        const challenge =
-          room.game
-            .challenges
-            ?.get(key);
-
-        if (!challenge) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Desafio expirado. Selecione a carta novamente.'
-            }
-          );
-        }
-
-        room.game
-          .challenges
-          .delete(key);
-
-        if (
-          Number(answer) !==
-          challenge.answer
-        ) {
-          return socket.emit(
-            'math:result',
-            {
-              ok:
-                false
-            }
-          );
-        }
-
-        p.hand.splice(
-          index,
-          1
-        );
-
-        applyCard(
-          room,
-          p,
-          card,
-          chosenColor
-        );
-
-        await checkRoomWinner(
-          room,
-          p
-        );
-
-        emitGame(
-          room
-        );
-
-        if (
-          room.started &&
-          room.players[
-            room.game
-              .currentIndex
-          ]?.isBot
-        ) {
-          setTimeout(
-            () =>
-              botTurn(
-                room
-              ),
-            800
-          );
-        }
-      }
-    );
-
-    /* =====================================================
-       COMPRAR CARTA
-    ===================================================== */
-
-    socket.on(
-      'game:draw',
-      () => {
-        const room =
-          findPlayerRoom(
-            me.id
-          );
-
-        if (
-          !room ||
-          !turnAllowed(
-            room,
-            me.id
-          )
-        ) {
-          return;
-        }
-
-        const p =
-          room.players.find(
-            x =>
-              x.userId ===
-              me.id
-          );
-
-        drawCards(
-          room,
-          p,
-          room.game
-            .pendingDraw ||
-            1
-        );
-
-        room.game
-          .pendingDraw = 0;
-
-        room.game
-          .currentIndex =
-          nextIndex(
-            room,
-            1
-          );
-
-        emitGame(
-          room
-        );
-
-        if (
-          room.started &&
-          room.players[
-            room.game
-              .currentIndex
-          ]?.isBot
-        ) {
-          setTimeout(
-            () =>
-              botTurn(
-                room
-              ),
-            800
-          );
-        }
-      }
-    );
-
-    /* =====================================================
-       DESAFIO MATEMÁTICO
-    ===================================================== */
-
-    socket.on(
-      'game:challenge',
-      ({
-        cardId
-      } = {}) => {
-        const room =
-          findPlayerRoom(
-            me.id
-          );
-
-        const p =
-          room?.players.find(
-            x =>
-              x.userId ===
-              me.id
-          );
-
-        const card =
-          p?.hand.find(
-            c =>
-              c.id ===
-                cardId ||
-              c._clientId ===
-                cardId
-          );
-
-        if (
-          !room ||
-          !card
-        ) {
-          return;
-        }
-
-        const c =
-          mathChallenge(
-            card
-          );
-
-        room.game
-          .challenges =
-          room.game
-            .challenges ||
-          new Map();
-
-        room.game
-          .challenges
-          .set(
-            `${me.id}:${card.id}`,
-            c
-          );
-
-        socket.emit(
-          'math:challenge',
-          {
-            a:
-              c.a,
-
-            b:
-              c.b,
-
-            op:
-              c.op,
-
-            cardId:
-              card.id
-          }
-        );
-      }
-    );
-
-    /* =====================================================
-       CHAT
-    ===================================================== */
-
-    socket.on(
-      'chat:send',
-      async ({
-        channel,
-        body,
-        roomCode,
-        receiverId
-      } = {}) => {
-        if (
-          !rateLimit(
-            chatRate,
-            me.id,
-            10000,
-            12
-          )
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Você está enviando mensagens rápido demais.'
-            }
-          );
-        }
-
-        const text =
-          cleanText(
-            body,
-            500
-          );
-
-        if (!text) {
-          return;
-        }
-
-        const aiModeration =
-          await geminiModerate(
-            text
-          );
-
-        if (
-          !aiModeration
-            .allowed
-        ) {
-          if (
-            usePostgres
-          ) {
-            await pool.query(
-              `
-                INSERT INTO reports(
-                  reporter_id,
-                  target_id,
-                  reason,
-                  status
-                )
-                VALUES(
-                  $1,
-                  $2,
-                  $3,
-                  $4
-                )
-              `,
-              [
-                me.id,
-                me.id,
-                'Gemini bloqueou mensagem: ' +
-                  cleanText(
-                    aiModeration.reason,
-                    220
-                  ),
-                'ai-block'
-              ]
-            );
-          }
-
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Mensagem bloqueada pela moderação.'
-            }
-          );
-        }
-
-        const mod =
-          await activeModeration(
-            me.id
-          );
-
-        if (
-          mod?.action ===
-          'mute'
-        ) {
-          return socket.emit(
-            'toast',
-            {
-              type:
-                'error',
-              message:
-                'Você está silenciado.'
-            }
-          );
-        }
-
-        /*
-         * Comandos do CEO.
-         */
-        if (
-          text.startsWith(
-            '/'
-          ) &&
-          me.role ===
-            'CEO'
-        ) {
-          const result =
-            await executeAdminCommand(
-              me,
-              text
-            );
-
-          socket.emit(
-            'admin:result',
-            result
-          );
-
-          return;
-        }
-
-        const ch =
-          [
-            'world',
-            'room',
-            'private'
-          ].includes(
-            channel
-          )
-            ? channel
-            : 'world';
-
-        let room =
-          findPlayerRoom(
-            me.id
-          );
-
-        if (
-          ch ===
-            'room' &&
-          (
-            !room ||
-            room.code !==
-              String(
-                roomCode ||
-                  room?.code
-              ).toUpperCase()
-          )
-        ) {
-          return;
-        }
-
-        let targetSocket =
-          null;
-
-        if (
-          ch ===
-          'private'
-        ) {
-          targetSocket =
-            [
-              ...socketUsers
-                .entries()
-            ].find(
-              ([, u]) =>
-                Number(
-                  u.userId
-                ) ===
-                Number(
-                  receiverId
-                )
-            )?.[0] ||
-            null;
-
-          if (
-            !targetSocket
-          ) {
-            return socket.emit(
-              'toast',
-              {
-                type:
-                  'error',
-                message:
-                  'Jogador offline.'
-              }
-            );
-          }
-        }
-
-        const msg = {
-          channel:
-            ch,
-
-          roomCode:
-            room?.code ||
-            null,
-
-          senderId:
-            me.id,
-
-          senderName:
-            me.username,
-
-          receiverId:
-            receiverId ||
-            null,
-
-          body:
-            text,
-
-          createdAt:
-            new Date().toISOString()
-        };
-
-        if (
-          usePostgres
-        ) {
-          await pool.query(
-            `
-              INSERT INTO chat_messages(
-                channel,
-                room_code,
-                sender_id,
-                receiver_id,
-                sender_name,
-                body
-              )
-              VALUES(
-                $1,
-                $2,
-                $3,
-                $4,
-                $5,
-                $6
-              )
-            `,
-            [
-              ch,
-              msg.roomCode,
-              me.id,
-              receiverId ||
-                null,
-              me.username,
-              text
-            ]
-          );
-        }
-
-        if (
-          ch ===
-          'world'
-        ) {
-          io.emit(
-            'chat:message',
-            msg
-          );
-        } else if (
-          ch ===
-          'room'
-        ) {
-          io
-            .to(
-              `room:${room.code}`
-            )
-            .emit(
-              'chat:message',
-              msg
-            );
-        } else {
-          socket.emit(
-            'chat:message',
-            msg
-          );
-
-          if (
-            targetSocket
-          ) {
-            io
-              .to(
-                targetSocket
-              )
-              .emit(
-                'chat:message',
-                msg
-              );
-          }
-        }
-      }
-    );
-
-    socket.on(
-      'disconnect',
-      () => {
-        console.log(
-          '🔌 Socket desconectado:',
-          me.username
-        );
-
-        socketUsers.delete(
-          socket.id
-        );
-      }
-    );
-  }
-);
-
-/* =========================================================
-   FUNÇÕES DO JOGO
-========================================================= */
-
-function findPlayerRoom(
-  userId
-) {
-  for (
-    const room of
-      rooms.values()
-  ) {
-    if (
-      room.players.some(
-        p =>
-          String(
-            p.userId
-          ) ===
-          String(
-            userId
-          )
-      )
-    ) {
-      return room;
-    }
-  }
-
-  return null;
-}
-
-function mathChallenge(
-  card
-) {
-  let a;
-  let b;
-  let op;
-
-  if (
-    card.type ===
-    'draw4'
-  ) {
-    a =
-      3 +
-      Math.floor(
-        Math.random() *
-          9
-      );
-
-    b =
-      2 +
-      Math.floor(
-        Math.random() *
-          8
-      );
-
-    op = '×';
-  } else if (
-    card.type ===
-    'draw2'
-  ) {
-    a =
-      2 +
-      Math.floor(
-        Math.random() *
-          8
-      );
-
-    b =
-      2 +
-      Math.floor(
-        Math.random() *
-          8
-      );
-
-    op = '×';
-  } else if (
-    card.type ===
-      'skip' ||
-    card.type ===
-      'reverse'
-  ) {
-    a =
-      15 +
-      Math.floor(
-        Math.random() *
-          30
-      );
-
-    b =
-      1 +
-      Math.floor(
-        Math.random() *
-          Math.min(
-            15,
-            a - 1
-          )
-      );
-
-    op = '−';
-  } else if (
-    card.type ===
-    'wild'
-  ) {
-    a =
-      10 +
-      Math.floor(
-        Math.random() *
-          20
-      );
-
-    b =
-      1 +
-      Math.floor(
-        Math.random() *
-          10
-      );
-
-    op = '+';
-  } else {
-    a =
-      5 +
-      Math.floor(
-        Math.random() *
-          35
-      );
-
-    b =
-      1 +
-      Math.floor(
-        Math.random() *
-          25
-      );
-
-    op = '+';
-  }
-
-  return {
-    a,
-    b,
-    op,
-
-    answer:
-      op === '×'
-        ? a * b
-        : op === '−'
-          ? a - b
-          : a + b
-  };
-}
-
-/* =========================================================
-   COMANDOS DO CEO
-========================================================= */
-
-async function executeAdminCommand(
-  me,
-  text
-) {
-  const parts =
-    text
-      .trim()
-      .split(/\s+/);
-
-  const cmd =
-    parts.shift()
-      .toLowerCase();
-
-  const args =
-    parts.join(' ');
-
-  if (
-    me.role !==
-    'CEO'
-  ) {
-    return {
-      ok: false,
-      message:
-        'Comando restrito.'
-    };
-  }
-
-  try {
-    if (
-      cmd ===
-      '/help'
-    ) {
-      return {
-        ok: true,
-
-        message: [
-          '/help',
-          '/paralisaruno [mensagem]',
-          '/desparalisaruno',
-          '/anuncio [mensagem]',
-          '/kick [usuario]',
-          '/ban [usuario] [minutos] [motivo]',
-          '/unban [usuario]',
-          '/mute [usuario] [minutos]',
-          '/unmute [usuario]',
-          '/darcoins [usuario] [quantidade]',
-          '/darxp [usuario] [quantidade]',
-          '/removecoins [usuario] [quantidade]',
-          '/criar staff [usuario]',
-          '/bloqueiochat',
-          '/desbloqueiochat',
-          '/status',
-          '/salas',
-          '/fecharsala [codigo]',
-          '/evento [mensagem]'
-        ].join('\n')
-      };
-    }
-
-    /* =====================================================
-       MODO MANUTENÇÃO / PARALISAR
-    ===================================================== */
-
-    if (
-      cmd ===
-      '/paralisaruno'
-    ) {
-      globalState = {
-        paused:
-          true,
-
-        message:
-          cleanText(
-            args ||
-              'UNO Matematixa paralisado pelo CEO.',
-            500
-          )
-      };
-
-      if (
-        usePostgres
-      ) {
-        await pool.query(
-          `
-            UPDATE global_game_state
-
-            SET
-              paused=true,
-              message=$1,
-              updated_by=$2,
-              updated_at=CURRENT_TIMESTAMP
-
-            WHERE id=1
-          `,
-          [
-            globalState.message,
-            me.id
-          ]
-        );
-      }
-
-      io.emit(
-        'global:pause',
-        globalState
-      );
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Jogo paralisado.'
-      };
-    }
-
-    if (
-      cmd ===
-      '/desparalisaruno'
-    ) {
-      globalState = {
-        paused:
-          false,
-
-        message:
-          ''
-      };
-
-      if (
-        usePostgres
-      ) {
-        await pool.query(
-          `
-            UPDATE global_game_state
-
-            SET
-              paused=false,
-              message='',
-              updated_by=$1,
-              updated_at=CURRENT_TIMESTAMP
-
-            WHERE id=1
-          `,
-          [me.id]
-        );
-      }
-
-      io.emit(
-        'global:resume'
-      );
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Jogo liberado.'
-      };
-    }
-
-    /* =====================================================
-       ANÚNCIO
-    ===================================================== */
-
-    if (
-      cmd ===
-        '/anuncio' ||
-      cmd ===
-        '/evento'
-    ) {
-      const m =
-        cleanText(
-          args,
-          500
-        );
-
-      if (!m) {
-        return {
-          ok: false,
-          message:
-            'Informe uma mensagem.'
-        };
-      }
-
-      io.emit(
-        'admin:announcement',
-        {
-          message:
-            m,
-
-          by:
-            me.username
-        }
-      );
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Mensagem enviada.'
-      };
-    }
-
-    /* =====================================================
-       STATUS
-    ===================================================== */
-
-    if (
-      cmd ===
-      '/status'
-    ) {
-      return {
-        ok: true,
-
-        message:
-          `Salas: ${rooms.size} | Conectados: ${socketUsers.size} | Paralisado: ${globalState.paused}`
-      };
-    }
-
-    /* =====================================================
-       SALAS
-    ===================================================== */
-
-    if (
-      cmd ===
-      '/salas'
-    ) {
-      return {
-        ok: true,
-
-        message:
-          [
-            ...rooms.values()
-          ]
-            .map(
-              r =>
-                `${r.code} ${r.name} ${r.players.length}/${r.options.maxPlayers}`
-            )
-            .join('\n') ||
-          'Nenhuma sala.'
-      };
-    }
-
-    if (
-      cmd ===
-      '/fecharsala'
-    ) {
-      const code =
-        args.toUpperCase();
-
-      const room =
-        rooms.get(
-          code
-        );
-
-      if (!room) {
-        return {
-          ok: false,
-          message:
-            'Sala não encontrada.'
-        };
-      }
-
-      io
-        .to(
-          `room:${code}`
-        )
-        .emit(
-          'room:closed',
-          {
-            message:
-              'Sala fechada pelo CEO.'
-          }
-        );
-
-      rooms.delete(
-        code
-      );
-
-      io.emit(
-        'rooms:update'
-      );
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Sala fechada.'
-      };
-    }
-
-    /* =====================================================
-       USUÁRIO ALVO
-    ===================================================== */
-
-    const targetName =
-      parts[0];
-
-    let target =
-      null;
-
-    if (
-      targetName
-    ) {
-      if (
-        usePostgres
-      ) {
-        const r =
-          await pool.query(
-            `
-              SELECT *
-              FROM users
-              WHERE LOWER(username)=LOWER($1)
-              LIMIT 1
-            `,
-            [targetName]
-          );
-
-        target =
-          r.rows[0] ||
-          null;
-      } else {
-        target =
-          localDb()
-            .users.find(
-              u =>
-                u.username.toLowerCase() ===
-                targetName.toLowerCase()
-            ) ||
-          null;
-      }
-    }
-
-    const commandsWithTarget = [
-      '/kick',
-      '/ban',
-      '/mute',
-      '/unban',
-      '/unmute',
-      '/darcoins',
-      '/darxp',
-      '/removecoins'
-    ];
-
-    if (
-      commandsWithTarget.includes(
-        cmd
-      ) &&
-      !target
-    ) {
-      return {
-        ok: false,
-        message:
-          'Usuário não encontrado.'
-      };
-    }
-
-    /* =====================================================
-       KICK
-    ===================================================== */
-
-    if (
-      cmd ===
-      '/kick'
-    ) {
-      for (
-        const [
-          sid,
-          u
-        ] of socketUsers
-      ) {
-        if (
-          u.userId ===
-          target.id
-        ) {
-          io
-            .to(sid)
-            .emit(
-              'admin:kick',
-              {
-                message:
-                  'Você foi removido pelo CEO.'
-              }
-            );
-        }
-      }
-
-      const room =
-        findPlayerRoom(
-          target.id
-        );
-
-      if (room) {
-        removePlayer(
-          room,
-          target.id
-        );
-      }
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          `${target.username} removido.`
-      };
-    }
-
-    /* =====================================================
-       BAN / MUTE
-    ===================================================== */
-
-    if (
-      cmd ===
-        '/ban' ||
-      cmd ===
-        '/mute'
-    ) {
-      const mins =
-        Math.min(
-          43200,
-          Math.max(
-            1,
-            Number(
-              parts[1]
-            ) || 60
-          )
-        );
-
-      const reason =
-        cleanText(
-          parts
-            .slice(2)
-            .join(' ') ||
-            'Moderação CEO.',
-          255
-        );
-
-      if (
-        usePostgres
-      ) {
-        await pool.query(
-          `
-            INSERT INTO moderation_actions(
-              actor_id,
-              target_id,
-              action,
-              reason,
-              expires_at
-            )
-            VALUES(
-              $1,
-              $2,
-              $3,
-              $4,
-              CURRENT_TIMESTAMP +
-                ($5 || ' minutes')::interval
-            )
-          `,
-          [
-            me.id,
-            target.id,
-            cmd ===
-            '/ban'
-              ? 'ban'
-              : 'mute',
-            reason,
-            mins
-          ]
-        );
-      }
-
-      if (
-        cmd ===
-        '/ban'
-      ) {
-        for (
-          const [
-            sid,
-            u
-          ] of socketUsers
-        ) {
-          if (
-            u.userId ===
-            target.id
-          ) {
-            io
-              .to(sid)
-              .emit(
-                'admin:kick',
-                {
-                  message:
-                    'Sua conta foi suspensa.'
-                }
-              );
-          }
-        }
-      }
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          `${target.username} ${
-            cmd === '/ban'
-              ? 'banido'
-              : 'silenciado'
-          } por ${mins} minutos.`
-      };
-    }
-
-    /* =====================================================
-       UNBAN / UNMUTE
-    ===================================================== */
-
-    if (
-      cmd ===
-        '/unban' ||
-      cmd ===
-        '/unmute'
-    ) {
-      if (
-        usePostgres
-      ) {
-        await pool.query(
-          `
-            UPDATE moderation_actions
-
-            SET expires_at=
-              CURRENT_TIMESTAMP
-
-            WHERE target_id=$1
-
-            AND action=$2
-
-            AND (
-              expires_at IS NULL
-              OR expires_at>CURRENT_TIMESTAMP
-            )
-          `,
-          [
-            target.id,
-            cmd ===
-            '/unban'
-              ? 'ban'
-              : 'mute'
-          ]
-        );
-      }
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Punição encerrada.'
-      };
-    }
-
-    /* =====================================================
-       COINS / XP
-    ===================================================== */
-
-    if (
-      cmd ===
-        '/darcoins' ||
-      cmd ===
-        '/darxp' ||
-      cmd ===
-        '/removecoins'
-    ) {
-      const qty =
-        Math.floor(
-          Number(
-            parts[1]
-          )
-        );
-
-      if (
-        !Number.isFinite(
-          qty
-        ) ||
-        qty <= 0
-      ) {
-        return {
-          ok: false,
-          message:
-            'Quantidade inválida.'
-        };
-      }
-
-      const delta =
-        cmd ===
-        '/darxp'
-          ? qty
-          : -qty;
-
-      const coinDelta =
-        cmd ===
-        '/darcoins'
-          ? qty
-          : cmd ===
-              '/removecoins'
-            ? -qty
-            : 0;
-
-      await addEconomy(
-        target.id,
-        coinDelta,
-        delta
-      );
-
-      await logAdmin(
-        me.id,
-        cmd,
-        args
-      );
-
-      return {
-        ok: true,
-        message:
-          'Economia atualizada.'
-      };
-    }
-
-    /* =====================================================
-       CRIAR STAFF
-    ===================================================== */
-
-    if (
-      cmd ===
-        '/criar' &&
-      parts[0]?.toLowerCase() ===
-        'staff'
-    ) {
-      const name =
-        cleanText(
-          parts[1],
-          24
-        );
-
-      if (
-        !validUsername(
-          name
-        )
-      ) {
-        return {
-          ok: false,
-          message:
-            'Usuário inválido.'
-        };
-      }
-
-      const pass =
-        crypto.randomBytes(
-          9
-        ).toString(
-          'base64url'
-        );
-
-      const hash =
-        await bcrypt.hash(
-          pass,
-          12
-        );
-
-      if (
-        usePostgres
-      ) {
-        const r =
-          await pool.query(
-            `
-              INSERT INTO users(
-                username,
-                password_hash,
-                role,
-                coins,
-                xp,
-                level
-              )
-              VALUES(
-                $1,
-                $2,
-                'staff',
-                5000,
-                5000,
-                10
-              )
-
-              RETURNING username
-            `,
-            [
-              name,
-              hash
-            ]
-          );
-
-        return {
-          ok: true,
-          message:
-            `Staff ${r.rows[0].username} criado. Senha temporária: ${pass}`
-        };
-      }
-
-      return {
-        ok: false,
-        message:
-          'Criação de staff requer PostgreSQL.'
-      };
-    }
-
-    return {
-      ok: false,
-      message:
-        'Comando desconhecido. Use /help.'
-    };
-  } catch (e) {
-    console.error(
-      'admin',
-      e
-    );
-
-    return {
-      ok: false,
-      message:
-        'Falha no comando administrativo.'
-    };
-  }
-}
-
-/* =========================================================
-   404 PARA API
-========================================================= */
-
-app.use(
-  (
-    req,
-    res,
-    next
-  ) => {
-    if (
-      req.path.startsWith(
-        '/api/'
-      ) &&
-      !res.headersSent &&
-      req.method ===
-        'GET' &&
-      req.path ===
-        '/api/unknown'
-    ) {
-      return res.status(404).json({
-        success: false
-      });
-    }
-
-    next();
-  }
-);
-
-/* =========================================================
-   START SERVER
-========================================================= */
-
-server.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
-    console.log(
-      `🚀 UnoVelho Matematixa ativo na porta ${PORT}`
-    );
-
-    databaseReadyPromise =
-      (async () => {
-        try {
-          await initDatabase();
-
-          globalState =
-            await getGlobalState();
-
-          databaseReady =
-            true;
-
-          console.log(
-            '✅ Banco de dados pronto para as requisições.'
-          );
-        } catch (err) {
-          databaseReadyError =
-            err;
-
-          console.error(
-            '❌ Falha ao finalizar inicialização do banco:',
-            err.message
-          );
-        }
-      })();
-  }
-);
-
-/* =========================================================
-   ENCERRAMENTO
-========================================================= */
-
-process.on(
-  'SIGTERM',
-  async () => {
-    try {
-      await pool?.end();
-    } finally {
-      process.exit(
-        0
-      );
-    }
-  }
-);
-
-process.on(
-  'SIGINT',
-  async () => {
-    try {
-      await pool?.end();
-    } finally {
-      process.exit(
-        0
-      );
-    }
-  }
-);
+  await pool.query(`
+    UPDATE rooms SET status='closed'
+    WHERE status='waiting' AND last_activity_at < now() - interval '15 minutes'
+  `).catch(()=>{});
+},1000);
+
+server.listen(PORT,()=>console.log(`Uno50 server listening on ${PORT}`));
+
+process.on('SIGTERM',async()=>{await pool.end();process.exit(0)});
+process.on('SIGINT',async()=>{await pool.end();process.exit(0)});
