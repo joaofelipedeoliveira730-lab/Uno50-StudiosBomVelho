@@ -1,0 +1,1 @@
+As imagens enviadas pelo usuário foram usadas apenas como referência de composição: mesa central, cartas ao redor, jogadores nas bordas e sensação de arena. O pacote não copia os mapas, personagens ou interface das referências.
